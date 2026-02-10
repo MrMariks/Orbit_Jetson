@@ -35,7 +35,7 @@ def check_parking_zone(geojson_file, current_lat, current_lon):
 
 # --- ТЕСТОВЫЙ БЛОК ---
 
-# Путь к твоему файлу, который ты скачал с geojson.io
+# Путь к твоему файлу, который ты скачал с geojson.iojkhdfkgjkdfgjjkdfgj
 file_path = 'data/map.geojson'
 
 # Пример координат (подставь свои реальные данные из GPS)
