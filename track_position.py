@@ -22,7 +22,7 @@ def check_parking_zone(geojson_file, current_lat, current_lon):
     # Важно: в GeoJSON формат обычно [Долгота, Широта] (Long, Lat)
     car_location = Point(current_lon, current_lat)
 
-    # 3. Перебираем все зоны в файле (если их несколько)
+    # 3. Перебираем все зоны в файле (если их несколько)123321
     for feature in gj['features']:
         polygon = shape(feature['geometry'])
         zone_name = feature['properties'].get('name', 'Без названия')
