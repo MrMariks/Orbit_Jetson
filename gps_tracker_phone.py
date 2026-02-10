@@ -5,8 +5,8 @@ import os
 from shapely.geometry import shape, Point
 
 # --- НАСТРОЙКИ (Возьми из приложения на телефоне) ---
-IP_ADDRESS = '192.168.1.5'  # IP твоего телефона
-PORT = 11123  # Порт (у GPS2IP на iOS это часто 11123)
+IP_ADDRESS = '192.168.1.1'
+PORT = 8080
 
 # --- НАСТРОЙКИ КАРТЫ ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
