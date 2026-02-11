@@ -25,15 +25,13 @@ def generate_pavlodar_parking_data():
 
             # В Павлодаре цена чаще фиксированная за сутки или час
             price = random.choice([100, 150, 200])
-
-            parking_data.append({
-                "city": "Pavlodar",
-                "lat": lat,
-                "lon": lon,
-                "fee": "yes",
-                "price": price
-            })
-            object_id += 1
+        parking_data.append({
+            "city": "Pavlodar",
+            "lat": lat,
+            "lon": lon,
+            "fee": "yes",
+            "price": price
+        })
 
     with open('pavlodar_fixed_registry.json', 'w', encoding='utf-8') as f:
         json.dump(parking_data, f, ensure_ascii=False, indent=4)
