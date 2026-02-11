@@ -28,16 +28,11 @@ def generate_pavlodar_parking_data():
             price = random.choice([100, 150, 200])
 
             parking_data.append({
-                "id": object_id,
                 "city": "Pavlodar",
-                "zone_name": zone["name"],
-                "address": f"ул. {random.choice(['Ломова', 'Катаева', 'Торайгырова', 'Лермонтова'])}, {random.randint(1, 150)}",
                 "lat": lat,
                 "lon": lon,
                 "fee": "yes",
-                "price": price,
-                "currency": "KZT",
-                "type": random.choice(["private_parking", "mall_parking", "street_side"])
+                "price": price
             })
             object_id += 1
 
