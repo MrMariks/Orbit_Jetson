@@ -15,7 +15,6 @@ def generate_pavlodar_parking_data():
     ]
 
     parking_data = []
-    object_id = 7001  # Начнем ID для Павлодара с 7000
 
     for zone in zones:
         # Генерируем по 75-80 точек на каждую зону для достижения нужного объема
