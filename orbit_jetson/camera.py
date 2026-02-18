@@ -244,8 +244,8 @@ class CameraWorker:
         logger.debug("Камера: открыта (индекс %s)", self._used_camera_index)
         return True
 
-    def _open_and_get_useful_frame(self, index: int):
-        """Открыть камеру по индексу; на Windows пробуем DSHOW, затем MSMF (для Iriun и др.)."""
+    def _open_and_get_useful_frame(self, index: int, accept_any_frame: bool = False):
+        """Открыть камеру по индексу; на Windows — DSHOW, затем MSMF. Если accept_any_frame=True (индекс из конфига), принимаем первый же кадр — для потока с телефона (Iriun)."""
         backends = []
         if IS_WINDOWS:
             backends = [cv2.CAP_DSHOW]
@@ -257,18 +257,25 @@ class CameraWorker:
                 if cap:
                     cap.release()
                 continue
-            time.sleep(0.7)
-            for _ in range(50):
-                ret, frame = cap.read()
-                if ret and _frame_is_useful(frame):
-                    return cap
-                time.sleep(0.05)
-            # Iriun иногда отдаёт чёрные кадры в первые секунды — примем камеру, если хотя бы читается
-            for _ in range(30):
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    return cap
-                time.sleep(0.1)
+            time.sleep(0.5 if accept_any_frame else 0.7)
+            if accept_any_frame:
+                # Источник из конфига (телефон/Iriun): принимаем первый же читаемый кадр, не ждём «не чёрный»
+                for _ in range(80):
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        return cap
+                    time.sleep(0.05)
+            else:
+                for _ in range(50):
+                    ret, frame = cap.read()
+                    if ret and _frame_is_useful(frame):
+                        return cap
+                    time.sleep(0.05)
+                for _ in range(30):
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        return cap
+                    time.sleep(0.1)
             cap.release()
         return None
 
@@ -297,7 +304,8 @@ class CameraWorker:
             # Сначала пробуем индекс из конфига (например 1 = Iriun/телефон), потом 0, 2 — чтобы на ноутбуке брать поток с телефона, а не встроенную вебку
             order = [self.camera_index] + [i for i in (0, 1, 2) if i != self.camera_index]
             for idx in order:
-                cap = self._open_and_get_useful_frame(idx)
+                prefer = idx == self.camera_index
+                cap = self._open_and_get_useful_frame(idx, accept_any_frame=prefer)
                 if cap is not None:
                     self._cap = cap
                     self._used_camera_index = idx
@@ -306,7 +314,7 @@ class CameraWorker:
                     self._pending_plates.clear()
                     self._last_dedup_time = time.time()
                     self._first_frame_logged = False
-                    logger.debug("Камера: используется индекс %s (Iriun/виртуальная — проверены 0,1,2 и DSHOW/MSMF)", idx)
+                    logger.info("Камера: используется индекс %s%s", idx, " (источник из конфига, например телефон)" if prefer else "")
                     return True
             logger.warning("Камера: по индексам 0, 1, 2 нет изображения. Открываю индекс %s.", self.camera_index)
         if not self._open_source():
