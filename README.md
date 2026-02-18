@@ -25,63 +25,72 @@ orbit_jetson/
 
 ## Быстрый старт
 
-### 1. Окружение и зависимости
+### С другого ПК (клонирование с GitHub)
 
 ```bash
+git clone https://github.com/<ваш-логин>/Orbit_Jetson.git
 cd Orbit_Jetson
+
 python -m venv venv
 # Windows:
 venv\Scripts\activate
 # Linux/macOS:
-# source venv/bin/activate
+source venv/bin/activate
 
 pip install -r requirements.txt
 ```
 
-На **Jetson** часто уже стоят PyTorch и CUDA; при конфликтах установите пакеты по [инструкциям для Jetson](https://developer.nvidia.com/embedded/downloads).
+Создайте файл с API-ключом:
 
-### 2. Конфигурация
+- Скопируйте `orbit_jetson/api_key.txt.example` в `orbit_jetson/api_key.txt`.
+- Откройте `api_key.txt` и замените содержимое на ваш ключ из Orbit_Backend (одна строка).
 
-Откройте `orbit_jetson/config.py` и задайте:
+При необходимости отредактируйте `orbit_jetson/config.py`: **BACKEND_URL**, **CAMERA_INDEX**.
 
-- **API_TOKEN** — токен, выданный в Orbit_Backend для этого патруля.
-- **BACKEND_URL** — адрес сервера (например, `http://192.168.1.100:8000` без слэша в конце).
-
-При необходимости измените:
-
-- `TELEMETRY_INTERVAL_SEC` — интервал отправки GPS (по умолчанию 8 с).
-- `CAMERA_INDEX` — индекс камеры (0 — по умолчанию).
-- `DEBUG_VIDEO_PATH` — путь к видеофайлу для теста без камеры.
-
-### 3. Запуск
-
-Из корня репозитория:
+Запуск:
 
 ```bash
 python -m orbit_jetson.main
 ```
 
-или из папки `orbit_jetson`:
+В окне нажмите **«Старт мониторинга»**.
+
+---
+
+### Уже есть репозиторий локально
 
 ```bash
-python main.py
+cd Orbit_Jetson
+python -m venv venv
+venv\Scripts\activate   # Windows
+pip install -r requirements.txt
 ```
 
-В окне: нажмите **«Старт мониторинга»** — пойдёт видеопоток, распознавание номеров и отправка телеметрии на бэкенд.
+Создайте `orbit_jetson/api_key.txt` с одной строкой — API-ключ. Запуск: `python -m orbit_jetson.main`.
+
+### Конфигурация
+
+- **API-ключ** — хранится в `orbit_jetson/api_key.txt` (одна строка, без пробелов). Файл не коммитится в git.
+- **orbit_jetson/config.py** — BACKEND_URL, CAMERA_INDEX, PATROL_LICENSE_PLATE, GPS и др.
+
+### Запуск
+
+Из корня проекта:
+
+```bash
+python -m orbit_jetson.main
+```
 
 ## Функционал
 
 - **Видеопоток** — отображение с камеры в реальном времени, рамки вокруг распознанных номеров.
-- **Распознанные номера** — список последних 5–10 номеров с временем; каждый номер отправляется на `POST /api/v1/detections`.
-- **Карта** — текущая позиция по GPS (TCP NMEA с телефона или координаты по умолчанию).
-- **Телеметрия** — периодическая отправка координат на `POST /api/v1/patrol/telemetry`.
+- **Распознанные номера** — список последних номеров; детекции (номер + фото) отправляются на `POST /api/v1/detect`. Повторы одного номера не шлются 12 часов.
+- **Карта** — позиция по GPS (TCP NMEA с телефона или координаты по умолчанию).
 
 ## API Backend
 
-Клиент ожидает, что Orbit_Backend предоставляет:
-
-- **POST /api/v1/patrol/telemetry** — тело JSON: `latitude`, `longitude`, опционально `altitude`, `speed_kmh`, `timestamp`. Заголовок: `Authorization: Bearer <API_TOKEN>`.
-- **POST /api/v1/detections** — тело JSON: `plate_number`, опционально `latitude`, `longitude`, `timestamp`. Тот же заголовок авторизации.
+- **POST /api/v1/detect** — JSON: `plate_text`, `full_image`, `crop_image` (base64). Заголовок: `Authorization: Bearer <API_TOKEN>`.
+- **POST /api/v1/patrol/telemetry** — JSON: `license_plate`, `timestamp` (при необходимости).
 
 ## GPS
 

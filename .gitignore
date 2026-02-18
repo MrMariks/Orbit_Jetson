@@ -1,2 +1,11 @@
 orbit_jetson/api_key.txt
 venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.env
+.env.*
+*.log
+requirements_frozen.txt
+offline_packages/
