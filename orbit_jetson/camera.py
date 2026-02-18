@@ -294,7 +294,9 @@ class CameraWorker:
         # Загрузка ALPR при старте мониторинга (ошибки — сразу в лог, не при первом кадре)
         _get_alpr_pipeline()
         if IS_WINDOWS:
-            for idx in (0, 1, 2):
+            # Сначала пробуем индекс из конфига (например 1 = Iriun/телефон), потом 0, 2 — чтобы на ноутбуке брать поток с телефона, а не встроенную вебку
+            order = [self.camera_index] + [i for i in (0, 1, 2) if i != self.camera_index]
+            for idx in order:
                 cap = self._open_and_get_useful_frame(idx)
                 if cap is not None:
                     self._cap = cap
