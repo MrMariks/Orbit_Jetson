@@ -1,0 +1,105 @@
+# -*- coding: utf-8 -*-
+"""
+Клиент для отправки данных на Orbit_Backend.
+"""
+
+import base64
+import logging
+import time
+from typing import Any, Dict, Optional, Union
+
+import requests
+
+from .config import API_TOKEN, BACKEND_URL, PATROL_LICENSE_PLATE
+from .gps import GpsPosition
+
+logger = logging.getLogger(__name__)
+
+
+class OrbitApiClient:
+    """Клиент API Orbit_Backend."""
+
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        api_token: Optional[str] = None,
+        timeout: int = 10,
+    ):
+        self.base_url = (base_url or BACKEND_URL).rstrip("/")
+        self.api_token = api_token or API_TOKEN
+        self.timeout = timeout
+        self._session = requests.Session()
+        self._session.headers.update({
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json",
+        })
+        self._logged_errors: set = set()  # (method, path, status_code) — не дублировать в консоль
+        self._last_telemetry_ok = False
+        self._last_detection_ok = False
+
+    def _request(self, method: str, path: str, json: Optional[Dict[str, Any]] = None) -> bool:
+        """Выполняет запрос. Возвращает True при успехе."""
+        url = f"{self.base_url}{path}"
+        try:
+            r = self._session.request(method, url, json=json, timeout=self.timeout)
+            if r.ok:
+                if method == "POST" and path == "/api/v1/patrol/telemetry":
+                    self._last_telemetry_ok = True
+                return True
+            key = (method, path, r.status_code)
+            if key not in self._logged_errors:
+                self._logged_errors.add(key)
+                logger.warning("API %s %s: %s %s", method, path, r.status_code, r.text[:200])
+            return False
+        except requests.RequestException as e:
+            logger.exception("API request failed: %s", e)
+            return False
+
+    def send_telemetry(self, position: GpsPosition) -> bool:
+        """
+        Отправляет телеметрию на POST /api/v1/patrol/telemetry (без координат, высоты и скорости).
+        """
+        payload = {
+            "license_plate": PATROL_LICENSE_PLATE.strip(),
+            "timestamp": position.timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        ok = self._request("POST", "/api/v1/patrol/telemetry", json=payload)
+        if ok:
+            logger.info("Сервер: телеметрия отправлена")
+        return ok
+
+    def send_detection(
+        self,
+        plate_text: str,
+        full_image: Union[bytes, bytearray],
+        crop_image: Union[bytes, bytearray],
+    ) -> bool:
+        """
+        Отправляет детекцию на POST /api/v1/detect (JSON: plate_text + base64 изображения).
+        """
+        url = f"{self.base_url}/api/v1/detect"
+        payload = {
+            "plate_text": plate_text.strip(),
+            "full_image": base64.b64encode(bytes(full_image)).decode("ascii"),
+            "crop_image": base64.b64encode(bytes(crop_image)).decode("ascii"),
+        }
+        full_len = len(payload["full_image"])
+        crop_len = len(payload["crop_image"])
+        logger.info(
+            "[Сервер] Отправка детекции: номер=%s, URL=%s, full_image=%s Кб, crop_image=%s Кб",
+            plate_text.strip(), url, full_len // 1024, crop_len // 1024,
+        )
+        try:
+            r = self._session.post(url, json=payload, timeout=self.timeout)
+            if r.ok:
+                self._last_detection_ok = True
+                logger.info("[Сервер] Детекция отправлена успешно (HTTP %s): %s", r.status_code, plate_text.strip())
+                return True
+            logger.warning(
+                "[Сервер] Ошибка отправки детекции: HTTP %s, ответ: %s",
+                r.status_code, r.text,
+            )
+            return False
+        except requests.RequestException as e:
+            logger.exception("[Сервер] Исключение при отправке детекции: %s", e)
+            return False

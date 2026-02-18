@@ -1,0 +1,16 @@
+# Orbit_Jetson — зависимости
+# Установка: pip install -r requirements.txt
+
+# nomeroff-net требует pkg_resources; в setuptools 82+ его убрали — фиксируем <82
+setuptools>=65.0.0,<82.0.0
+PyQt5>=5.15.0
+PyQtWebEngine>=5.15.0
+opencv-python>=4.5.0
+nomeroff-net>=4.0.0
+PyTurboJPEG>=1.7.0
+# Клиент для загрузки моделей nomeroff-net (репозиторий ria-com)
+git+https://github.com/ria-com/modelhub-client.git
+folium>=0.12.0
+requests>=2.26.0
+numpy>=1.19.0
+# nomeroff-net тянет torch/torchvision при установке
