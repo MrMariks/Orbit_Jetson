@@ -5,6 +5,7 @@
 """
 
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -333,7 +334,11 @@ class MainWindow(QMainWindow):
         running = self._camera.is_running()
         gps_ok = getattr(self._gps, "is_connected", lambda: False)()
         model_ok = self._camera.is_alpr_loaded() if running else False
-        server_ok = getattr(self._api, "_last_telemetry_ok", False) or getattr(self._api, "_last_detection_ok", False)
+        server_ok = (
+            getattr(self._api, "_server_reachable", False)
+            or getattr(self._api, "_last_telemetry_ok", False)
+            or getattr(self._api, "_last_detection_ok", False)
+        )
         camera_ok = self._camera.has_frame() if running else False
 
         if running:
@@ -375,6 +380,8 @@ class MainWindow(QMainWindow):
         self._display_timer = QTimer(self)
         self._display_timer.timeout.connect(self._paint_latest_frame)
         self._display_timer.start(25)
+        # Проверка доступности сервера в фоне — тогда в статус-баре сразу «Сервер ✓»
+        threading.Thread(target=self._api.check_server, daemon=True).start()
 
     def _on_stop(self):
         if self._display_timer:

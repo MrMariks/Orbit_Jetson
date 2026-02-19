@@ -203,6 +203,7 @@ class CameraWorker:
         self._alpr_stop = False
         self._alpr_cycle_count = 0
         self._alpr_no_frame_count = 0
+        self._alpr_dropped_conf_count = 0
 
     def set_gps(self, lat: Optional[float], lon: Optional[float]) -> None:
         self._last_lat, self._last_lon = lat, lon
@@ -407,11 +408,17 @@ class CameraWorker:
                         continue
                     raw_conf = conf_list[i] if i < len(conf_list) else 0.0
                     conf = float(min(raw_conf)) if isinstance(raw_conf, (list, tuple)) and raw_conf else float(raw_conf)
-                    if conf < self._conf_min:
-                        continue
                     raw_text = texts_list[i] if i < len(texts_list) else ""
                     text = "".join(str(x) for x in raw_text) if isinstance(raw_text, (list, tuple)) else str(raw_text)
                     text = normalize_plate(text.strip())
+                    if conf < self._conf_min:
+                        self._alpr_dropped_conf_count += 1
+                        if self._alpr_dropped_conf_count % 30 == 1:
+                            logger.info(
+                                "ALPR: номер отброшен по уверенности (%.2f < %.2f): «%s». Снизьте ALPR_CONFIDENCE_MIN в config.py до 0.70–0.75",
+                                conf, self._conf_min, text or "(пусто)",
+                            )
+                        continue
                     if not text or not looks_like_plate(text, self._allow_eu):
                         continue
                     points_xy = [(int(pts[j][0]), int(pts[j][1])) for j in range(min(4, len(pts)))]

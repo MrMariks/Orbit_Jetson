@@ -36,6 +36,28 @@ class OrbitApiClient:
         self._logged_errors: set = set()  # (method, path, status_code) — не дублировать в консоль
         self._last_telemetry_ok = False
         self._last_detection_ok = False
+        self._server_reachable = False  # True после успешной check_server() или любого запроса
+
+    def check_server(self) -> bool:
+        """
+        Проверка доступности бэкенда (GET по base_url).
+        Вызывать при старте мониторинга — тогда в статус-баре сразу будет «Сервер ✓», если API доступен.
+        """
+        url = self.base_url
+        try:
+            r = self._session.get(url, timeout=min(5, self.timeout))
+            if r.ok:
+                self._server_reachable = True
+                logger.info("Сервер доступен: %s", url)
+                return True
+            # 404 на корне — часто норма для API; считаем сервер доступным
+            if r.status_code == 404:
+                self._server_reachable = True
+                return True
+            return False
+        except requests.RequestException as e:
+            logger.debug("Сервер недоступен %s: %s", url, e)
+            return False
 
     def _request(self, method: str, path: str, json: Optional[Dict[str, Any]] = None) -> bool:
         """Выполняет запрос. Возвращает True при успехе."""
@@ -43,6 +65,7 @@ class OrbitApiClient:
         try:
             r = self._session.request(method, url, json=json, timeout=self.timeout)
             if r.ok:
+                self._server_reachable = True
                 if method == "POST" and path == "/api/v1/patrol/telemetry":
                     self._last_telemetry_ok = True
                 return True
@@ -92,6 +115,7 @@ class OrbitApiClient:
         try:
             r = self._session.post(url, json=payload, timeout=self.timeout)
             if r.ok:
+                self._server_reachable = True
                 self._last_detection_ok = True
                 logger.info("[Сервер] Детекция отправлена успешно (HTTP %s): %s", r.status_code, plate_text.strip())
                 return True
