@@ -22,6 +22,11 @@ with warnings.catch_warnings():
         )
 
 # Важно: загрузить PyTorch до PyQt5, иначе на Windows возможна ошибка загрузки DLL (WinError 1114 / c10.dll)
+# Если ALPR_USE_CPU — скрываем GPU от PyTorch до импорта, чтобы nomeroff-net считал на CPU
+import os
+from . import config as _config
+if getattr(_config, "ALPR_USE_CPU", False):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 try:
     import torch  # noqa: F401
 except Exception:
@@ -37,7 +42,7 @@ warnings.filterwarnings("ignore", message=".*Creating a tensor from a list.*")
 
 from PyQt5.QtWidgets import QApplication
 
-from .config import CAMERA_INDEX, PHONE_IP, GPS_PORT
+from .config import CAMERA_INDEX, PHONE_IP, GPS_PORT, ALPR_USE_CPU
 from .api_client import OrbitApiClient
 from .gps import get_gps
 from .camera import CameraWorker
@@ -55,6 +60,8 @@ def main():
     logger.info("Камера: индекс %s (статус при нажатии «Старт мониторинга»)", CAMERA_INDEX)
     logger.info("GPS: подключение к %s:%s (статус в консоли при подключении/обрыве)", PHONE_IP, GPS_PORT)
     logger.info("Распознавание номеров: ALPR (nomeroff-net), загрузка при старте мониторинга")
+    if ALPR_USE_CPU:
+        logger.info("ALPR: вычисления на CPU (ALPR_USE_CPU=True, подходит для ноутбуков без подходящей видеокарты)")
 
     api = OrbitApiClient()
     gps = get_gps()
