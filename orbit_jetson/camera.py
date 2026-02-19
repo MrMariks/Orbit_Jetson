@@ -365,8 +365,8 @@ class CameraWorker:
             frame = self._last_raw_frame.copy() if self._last_raw_frame is not None else None
         if frame is None:
             self._alpr_no_frame_count += 1
-            if self._alpr_no_frame_count % 20 == 1:
-                logger.info("ALPR: кадр от камеры не приходит. Проверьте: камера открыта? Картинка в окне есть?")
+            if self._alpr_no_frame_count % 10 == 1:
+                logger.info("ALPR: кадр от камеры не приходит (ожидание %s). Проверьте: камера открыта? Картинка в окне есть?", self._alpr_no_frame_count)
             return
         self._alpr_no_frame_count = 0
         if not getattr(self, "_alpr_first_frame_logged", False):
@@ -385,6 +385,8 @@ class CameraWorker:
             return
         try:
             from nomeroff_net.tools import unzip
+            if self._alpr_cycle_count == 1:
+                logger.info("ALPR: запуск модели на первом кадре (на CPU может занять 1–2 мин), подождите…")
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
                 cv2.imwrite(f.name, frame)
                 path = f.name
@@ -553,7 +555,7 @@ class CameraWorker:
         self._frame_count += 1
         if not self._first_frame_logged:
             self._first_frame_logged = True
-            logger.debug("Камера: OK, изображение получено")
+            logger.info("Камера: первый кадр получен (для показа и ALPR)")
         h, w = frame.shape[:2]
         max_w = 960
         jpeg_quality = 75
