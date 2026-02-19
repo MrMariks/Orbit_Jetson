@@ -175,11 +175,13 @@ class CameraThread(QThread):
         self._stopped = False
 
     def run(self):
+        import sys
         self._stopped = False
         # Открываем камеру в этом же потоке — иначе Iriun/виртуальная камера может не отдавать кадры
         if not self._camera.start():
             self.open_failed.emit()
             return
+        first_frame_logged = False
         while not self._stopped and self._camera.is_running():
             try:
                 ok, data = self._camera.read_frame()
@@ -188,6 +190,11 @@ class CameraThread(QThread):
                 self.msleep(100)
                 continue
             if ok and data:
+                if not first_frame_logged:
+                    first_frame_logged = True
+                    logger.info("Камера: первый кадр прочитан, картинка в окне и для ALPR")
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                 self.frame_ready.emit(data)
             else:
                 self.msleep(20)

@@ -367,11 +367,15 @@ class CameraWorker:
             self._alpr_no_frame_count += 1
             if self._alpr_no_frame_count % 10 == 1:
                 logger.info("ALPR: кадр от камеры не приходит (ожидание %s). Проверьте: камера открыта? Картинка в окне есть?", self._alpr_no_frame_count)
+                sys.stdout.flush()
+                sys.stderr.flush()
             return
         self._alpr_no_frame_count = 0
         if not getattr(self, "_alpr_first_frame_logged", False):
             self._alpr_first_frame_logged = True
             logger.info("ALPR: кадры с камеры приходят, запуск распознавания…")
+            sys.stdout.flush()
+            sys.stderr.flush()
         self._run_alpr_on_frame(frame)
 
     def _run_alpr_on_frame(self, frame: "np.ndarray") -> None:
@@ -387,6 +391,8 @@ class CameraWorker:
             from nomeroff_net.tools import unzip
             if self._alpr_cycle_count == 1:
                 logger.info("ALPR: запуск модели на первом кадре (на CPU может занять 1–2 мин), подождите…")
+                sys.stdout.flush()
+                sys.stderr.flush()
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
                 cv2.imwrite(f.name, frame)
                 path = f.name

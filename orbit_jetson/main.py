@@ -50,6 +50,13 @@ from .ui import MainWindow
 
 
 def main():
+    # Сразу выводить логи в консоль (важно для ноутбука / PowerShell)
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(line_buffering=True)
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:
+            pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
