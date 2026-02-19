@@ -202,6 +202,7 @@ class CameraWorker:
         self._alpr_thread: Optional[threading.Thread] = None
         self._alpr_stop = False
         self._alpr_cycle_count = 0
+        self._alpr_no_frame_count = 0
 
     def set_gps(self, lat: Optional[float], lon: Optional[float]) -> None:
         self._last_lat, self._last_lon = lat, lon
@@ -361,8 +362,13 @@ class CameraWorker:
     def run_alpr_on_latest_frame(self) -> None:
         with self._last_raw_frame_lock:
             frame = self._last_raw_frame.copy() if self._last_raw_frame is not None else None
-        if frame is not None:
-            self._run_alpr_on_frame(frame)
+        if frame is None:
+            self._alpr_no_frame_count += 1
+            if self._alpr_no_frame_count % 20 == 1:
+                logger.info("ALPR: кадр от камеры не приходит. Проверьте: камера открыта? Картинка в окне есть?")
+            return
+        self._alpr_no_frame_count = 0
+        self._run_alpr_on_frame(frame)
 
     def _run_alpr_on_frame(self, frame: "np.ndarray") -> None:
         """Запуск ALPR в отдельном потоке — не блокирует показ картинки."""
@@ -370,6 +376,8 @@ class CameraWorker:
         now = time.time()
         pipeline_fn = _get_alpr_pipeline()
         if pipeline_fn is None:
+            if self._alpr_cycle_count % 20 == 1:
+                logger.warning("ALPR: модель не загружена (nomeroff-net/PyTorch). Проверьте установку: pip install -r requirements.txt")
             return
         try:
             from nomeroff_net.tools import unzip
@@ -390,7 +398,10 @@ class CameraWorker:
                 texts_list = list(texts[0]) if texts and len(texts) > 0 else []
                 conf_list = list(confidences[0]) if confidences and len(confidences) > 0 else []
                 regions_list = list(region_names[0]) if region_names and len(region_names) > 0 else []
+                num_raw = len(points_list)
                 passed = 0
+                if num_raw == 0 and self._alpr_cycle_count % 30 == 1:
+                    logger.info("ALPR: модель работает, но в кадре номер не найден. На другом ПК попробуйте снизить ALPR_CONFIDENCE_MIN в config.py до 0.70")
                 for i, pts in enumerate(points_list):
                     if pts is None or len(pts) < 4:
                         continue
