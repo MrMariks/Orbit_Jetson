@@ -369,6 +369,9 @@ class CameraWorker:
                 logger.info("ALPR: кадр от камеры не приходит. Проверьте: камера открыта? Картинка в окне есть?")
             return
         self._alpr_no_frame_count = 0
+        if not getattr(self, "_alpr_first_frame_logged", False):
+            self._alpr_first_frame_logged = True
+            logger.info("ALPR: кадры с камеры приходят, запуск распознавания…")
         self._run_alpr_on_frame(frame)
 
     def _run_alpr_on_frame(self, frame: "np.ndarray") -> None:
@@ -401,8 +404,10 @@ class CameraWorker:
                 regions_list = list(region_names[0]) if region_names and len(region_names) > 0 else []
                 num_raw = len(points_list)
                 passed = 0
-                if num_raw == 0 and self._alpr_cycle_count % 30 == 1:
-                    logger.info("ALPR: модель работает, но в кадре номер не найден. На другом ПК попробуйте снизить ALPR_CONFIDENCE_MIN в config.py до 0.70")
+                if self._alpr_cycle_count == 1:
+                    logger.info("ALPR: первый кадр обработан, в кадре детекций: %s", num_raw)
+                if num_raw == 0 and self._alpr_cycle_count % 10 == 1:
+                    logger.info("ALPR: модель работает, в кадре номер не найден (цикл %s). Наведите на номер или снизьте ALPR_CONFIDENCE_MIN в config.py до 0.70", self._alpr_cycle_count)
                 for i, pts in enumerate(points_list):
                     if pts is None or len(pts) < 4:
                         continue
@@ -413,7 +418,7 @@ class CameraWorker:
                     text = normalize_plate(text.strip())
                     if conf < self._conf_min:
                         self._alpr_dropped_conf_count += 1
-                        if self._alpr_dropped_conf_count % 30 == 1:
+                        if self._alpr_dropped_conf_count % 10 == 1:
                             logger.info(
                                 "ALPR: номер отброшен по уверенности (%.2f < %.2f): «%s». Снизьте ALPR_CONFIDENCE_MIN в config.py до 0.70–0.75",
                                 conf, self._conf_min, text or "(пусто)",
