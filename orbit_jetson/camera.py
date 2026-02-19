@@ -9,6 +9,7 @@ import logging
 import re
 import sys
 import tempfile
+import threading
 import time
 import warnings
 from collections import Counter
@@ -196,6 +197,11 @@ class CameraWorker:
         self._min_bbox_h = ALPR_MIN_BBOX_HEIGHT
         self._min_bbox_area = ALPR_MIN_BBOX_AREA
         self._allow_eu = ALPR_ALLOW_EU
+        self._last_raw_frame: Optional["np.ndarray"] = None
+        self._last_raw_frame_lock = threading.Lock()
+        self._alpr_thread: Optional[threading.Thread] = None
+        self._alpr_stop = False
+        self._alpr_cycle_count = 0
 
     def set_gps(self, lat: Optional[float], lon: Optional[float]) -> None:
         self._last_lat, self._last_lon = lat, lon
@@ -314,12 +320,14 @@ class CameraWorker:
                     self._pending_plates.clear()
                     self._last_dedup_time = time.time()
                     self._first_frame_logged = False
+                    self._start_alpr_thread()
                     logger.info("Камера: используется индекс %s%s", idx, " (источник из конфига, например телефон)" if prefer else "")
                     return True
             logger.warning("Камера: по индексам 0, 1, 2 нет изображения. Открываю индекс %s.", self.camera_index)
         if not self._open_source():
             return False
         self._running = True
+        self._start_alpr_thread()
         self._last_detected.clear()
         self._pending_plates.clear()
         self._last_dedup_time = time.time()
@@ -339,8 +347,103 @@ class CameraWorker:
                 logger.warning("Камера: только чёрные кадры. Включите передачу с телефона.")
         return True
 
+    def _start_alpr_thread(self) -> None:
+        if self._alpr_thread is not None:
+            return
+        self._alpr_stop = False
+        def _alpr_loop() -> None:
+            while not self._alpr_stop and self._running:
+                self.run_alpr_on_latest_frame()
+                time.sleep(0.5)
+        self._alpr_thread = threading.Thread(target=_alpr_loop, daemon=True)
+        self._alpr_thread.start()
+
+    def run_alpr_on_latest_frame(self) -> None:
+        with self._last_raw_frame_lock:
+            frame = self._last_raw_frame.copy() if self._last_raw_frame is not None else None
+        if frame is not None:
+            self._run_alpr_on_frame(frame)
+
+    def _run_alpr_on_frame(self, frame: "np.ndarray") -> None:
+        """Запуск ALPR в отдельном потоке — не блокирует показ картинки."""
+        self._alpr_cycle_count += 1
+        now = time.time()
+        pipeline_fn = _get_alpr_pipeline()
+        if pipeline_fn is None:
+            return
+        try:
+            from nomeroff_net.tools import unzip
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                cv2.imwrite(f.name, frame)
+                path = f.name
+            try:
+                result = pipeline_fn([path])
+                unpacked = unzip(result)
+                if len(unpacked) >= 9:
+                    images_bboxs, images_points, region_names, confidences, texts = (
+                        unpacked[1], unpacked[2], unpacked[5], unpacked[7], unpacked[8]
+                    )
+                else:
+                    images_points, texts = ([], []), []
+                    confidences, region_names = [], []
+                points_list = (images_points[0] if images_points and len(images_points) > 0 else [])
+                texts_list = list(texts[0]) if texts and len(texts) > 0 else []
+                conf_list = list(confidences[0]) if confidences and len(confidences) > 0 else []
+                regions_list = list(region_names[0]) if region_names and len(region_names) > 0 else []
+                passed = 0
+                for i, pts in enumerate(points_list):
+                    if pts is None or len(pts) < 4:
+                        continue
+                    raw_conf = conf_list[i] if i < len(conf_list) else 0.0
+                    conf = float(min(raw_conf)) if isinstance(raw_conf, (list, tuple)) and raw_conf else float(raw_conf)
+                    if conf < self._conf_min:
+                        continue
+                    raw_text = texts_list[i] if i < len(texts_list) else ""
+                    text = "".join(str(x) for x in raw_text) if isinstance(raw_text, (list, tuple)) else str(raw_text)
+                    text = normalize_plate(text.strip())
+                    if not text or not looks_like_plate(text, self._allow_eu):
+                        continue
+                    points_xy = [(int(pts[j][0]), int(pts[j][1])) for j in range(min(4, len(pts)))]
+                    xs, ys = [p[0] for p in points_xy], [p[1] for p in points_xy]
+                    w, h = max(xs) - min(xs), max(ys) - min(ys)
+                    if h <= 0 or w <= 0:
+                        continue
+                    if w / h < 2.2 or w / h > 6.5:
+                        continue
+                    if w < self._min_bbox_w or h < self._min_bbox_h or (w * h) < self._min_bbox_area:
+                        continue
+                    passed += 1
+                    raw_region = regions_list[i] if i < len(regions_list) else self._country
+                    region = str(raw_region[0] if isinstance(raw_region, (list, tuple)) and raw_region else raw_region) if raw_region else self._country
+                    key = normalize_plate(text)
+                    if key not in self._pending_plates:
+                        self._pending_plates[key] = (self._alpr_cycle_count, now)
+                    else:
+                        first_cycle, first_time = self._pending_plates[key]
+                        if now - first_time > self._confirm_seconds:
+                            self._pending_plates[key] = (self._alpr_cycle_count, now)
+                        elif self._alpr_cycle_count - first_cycle >= ALPR_CONFIRM_CYCLES:
+                            if self._dedup_and_emit(text) and self.on_plate_detected:
+                                zoomed_img = self._crop_zoomed_region(frame, points_xy, expand_factor=2.0)
+                                zoomed_image_bytes = (cv2.imencode(".jpg", zoomed_img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes() if zoomed_img is not None else cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
+                                crop_img = self._crop_plate_region(frame, points_xy)
+                                crop_image_bytes = cv2.imencode(".jpg", crop_img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes() if crop_img is not None else zoomed_image_bytes
+                                self.on_plate_detected(text, self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
+                            del self._pending_plates[key]
+                for k in list(self._pending_plates):
+                    if now - self._pending_plates[k][1] > self._confirm_seconds + 1:
+                        del self._pending_plates[k]
+            finally:
+                Path(path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning("ALPR при разборе кадра: %s", e)
+
     def stop(self) -> None:
         self._running = False
+        self._alpr_stop = True
+        if self._alpr_thread is not None:
+            self._alpr_thread.join(timeout=5.0)
+            self._alpr_thread = None
         if self._cap:
             self._cap.release()
             self._cap = None
@@ -415,118 +518,16 @@ class CameraWorker:
 
     def read_frame(self) -> Tuple[bool, Optional[bytes]]:
         """
-        Кадр → раз в N кадров ALPR (nomeroff-net) → фильтр по формату и confidence ≥ 70%.
-        На кадре: полигон по 4 точкам номера, подпись «НОМЕР KZ».
+        Читает кадр и сразу отдаёт для показа — без блокировки на ALPR (распознавание в отдельном потоке).
         """
         if not self._running or not self._cap:
             return False, None
         ret, frame = self._cap.read()
         if not ret or frame is None:
             return False, None
-
+        with self._last_raw_frame_lock:
+            self._last_raw_frame = frame.copy()
         self._frame_count += 1
-        run_detection = self._frame_count % self._detect_every_n == 0
-
-        if run_detection:
-            pipeline_fn = _get_alpr_pipeline()
-            if pipeline_fn is not None:
-                try:
-                    from nomeroff_net.tools import unzip
-                    # Пайплайн принимает список путей к файлам или список numpy (BGR)
-                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                        cv2.imwrite(f.name, frame)
-                        path = f.name
-                    try:
-                        result = pipeline_fn([path])
-                        unpacked = unzip(result)
-                        # Полный пайплайн: images, bboxs, points, zones, region_ids, region_names, count_lines, confidences, texts
-                        if len(unpacked) >= 9:
-                            images_bboxs, images_points, region_names, confidences, texts = (
-                                unpacked[1], unpacked[2], unpacked[5], unpacked[7], unpacked[8]
-                            )
-                        else:
-                            images_points, texts = ([], [])
-                            confidences = []
-                            region_names = []
-                        points_list = (images_points[0] if images_points and len(images_points) > 0 else [])
-                        texts_list = list(texts[0]) if texts and len(texts) > 0 else []
-                        conf_list = list(confidences[0]) if confidences and len(confidences) > 0 else []
-                        regions_list = list(region_names[0]) if region_names and len(region_names) > 0 else []
-                        num_raw = len(points_list)
-                        passed = 0
-                        for i, pts in enumerate(points_list):
-                            if pts is None or len(pts) < 4:
-                                continue
-                            raw_conf = conf_list[i] if i < len(conf_list) else 0.0
-                            if isinstance(raw_conf, (list, tuple)):
-                                conf = float(min(raw_conf)) if raw_conf else 0.0
-                            else:
-                                conf = float(raw_conf)
-                            if conf < self._conf_min:
-                                logger.debug("ALPR отфильтровано: confidence %.2f < %.2f", conf, self._conf_min)
-                                continue
-                            raw_text = texts_list[i] if i < len(texts_list) else ""
-                            if isinstance(raw_text, (list, tuple)):
-                                text = "".join(str(x) for x in raw_text)
-                            else:
-                                text = str(raw_text)
-                            text = normalize_plate(text.strip())
-                            if not text or not looks_like_plate(text, self._allow_eu):
-                                logger.debug("ALPR отфильтровано по формату: '%s'", text or "(пусто)")
-                                continue
-                            points_xy = [(int(pts[j][0]), int(pts[j][1])) for j in range(min(4, len(pts)))]
-                            xs = [p[0] for p in points_xy]
-                            ys = [p[1] for p in points_xy]
-                            w, h = max(xs) - min(xs), max(ys) - min(ys)
-                            if h <= 0 or w <= 0:
-                                continue
-                            aspect = w / h
-                            if aspect < 2.2 or aspect > 6.5:
-                                continue
-                            if w < self._min_bbox_w or h < self._min_bbox_h or (w * h) < self._min_bbox_area:
-                                continue
-                            passed += 1
-                            raw_region = regions_list[i] if i < len(regions_list) else self._country
-                            if isinstance(raw_region, (list, tuple)) and raw_region:
-                                raw_region = raw_region[0]
-                            region = str(raw_region) if raw_region else self._country
-                            self._draw_plate_polygon(frame, points_xy, text, region)
-                            key = normalize_plate(text)
-                            now = time.time()
-                            if key not in self._pending_plates:
-                                self._pending_plates[key] = (self._frame_count, now)
-                            else:
-                                first_frame, first_time = self._pending_plates[key]
-                                if now - first_time > self._confirm_seconds:
-                                    self._pending_plates[key] = (self._frame_count, now)
-                                elif self._frame_count - first_frame >= self._confirm_min_frames:
-                                    if self._dedup_and_emit(text) and self.on_plate_detected:
-                                        # Фото 1: зум на номер (область вокруг номера)
-                                        zoomed_img = self._crop_zoomed_region(frame, points_xy, expand_factor=2.0)
-                                        if zoomed_img is not None:
-                                            _, zoomed_jpeg = cv2.imencode(".jpg", zoomed_img, [cv2.IMWRITE_JPEG_QUALITY, 88])
-                                            zoomed_image_bytes = zoomed_jpeg.tobytes()
-                                        else:
-                                            _, full_jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                                            zoomed_image_bytes = full_jpeg.tobytes()
-                                        # Фото 2: плотный кроп номера
-                                        crop_img = self._crop_plate_region(frame, points_xy)
-                                        crop_image_bytes = b""
-                                        if crop_img is not None:
-                                            _, crop_jpeg = cv2.imencode(".jpg", crop_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                                            crop_image_bytes = crop_jpeg.tobytes()
-                                        if not crop_image_bytes:
-                                            crop_image_bytes = zoomed_image_bytes
-                                        self.on_plate_detected(text, self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
-                                    del self._pending_plates[key]
-                            for k in list(self._pending_plates):
-                                if now - self._pending_plates[k][1] > self._confirm_seconds + 1:
-                                    del self._pending_plates[k]
-                    finally:
-                        Path(path).unlink(missing_ok=True)
-                except Exception as e:
-                    logger.warning("ALPR при разборе кадра: %s", e)
-
         if not self._first_frame_logged:
             self._first_frame_logged = True
             logger.debug("Камера: OK, изображение получено")
