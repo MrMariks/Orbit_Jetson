@@ -6,6 +6,7 @@
 
 import logging
 import sys
+import threading
 import warnings
 
 # pkg_resources нужен для nomeroff-net; в setuptools 82.0+ его убрали — нужен setuptools<82
@@ -40,12 +41,13 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="lightning_lite
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch\\.load.*weights_only.*")
 warnings.filterwarnings("ignore", message=".*Creating a tensor from a list.*")
 
+from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QApplication
 
 from .config import CAMERA_INDEX, PHONE_IP, GPS_PORT, ALPR_USE_CPU
 from .api_client import OrbitApiClient
 from .gps import get_gps
-from .camera import CameraWorker
+from .camera import CameraWorker, preload_alpr, warmup_camera
 from .ui import MainWindow
 
 
@@ -64,11 +66,11 @@ def main():
     )
     logger = logging.getLogger("orbit_jetson")
     logger.info("Orbit_Jetson starting")
-    logger.info("Камера: индекс %s (статус при нажатии «Старт мониторинга»)", CAMERA_INDEX)
+    logger.info("Камера: индекс %s (по «Старт мониторинга» — сразу видео и сканирование)", CAMERA_INDEX)
     logger.info("GPS: подключение к %s:%s (статус в консоли при подключении/обрыве)", PHONE_IP, GPS_PORT)
-    logger.info("Распознавание номеров: ALPR (nomeroff-net), загрузка при старте мониторинга")
+    logger.info("ALPR: подготовка при запуске — основное окно откроется по готовности")
     if ALPR_USE_CPU:
-        logger.info("ALPR: вычисления на CPU (ALPR_USE_CPU=True, подходит для ноутбуков без подходящей видеокарты)")
+        logger.info("ALPR: вычисления на CPU (ALPR_USE_CPU=True)")
 
     api = OrbitApiClient()
     gps = get_gps()
@@ -76,8 +78,29 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("Orbit_Jetson")
+
     win = MainWindow(camera_worker=camera, api_client=api, gps_stub=gps)
     win.showMaximized()
+    app.processEvents()
+
+    loading_done = [False]
+
+    def load_task():
+        preload_alpr()
+        api.check_server()
+        warmup_camera()  # прогрев камеры — при первом «Старт мониторинга» не зависает
+        loading_done[0] = True
+
+    def on_loading_check():
+        if loading_done[0]:
+            win.show_main_content()
+            logger.info("Приложение готово к работе")
+            return
+        QTimer.singleShot(350, on_loading_check)
+
+    threading.Thread(target=load_task, daemon=True).start()
+    QTimer.singleShot(350, on_loading_check)
+
     sys.exit(app.exec_())
 
 

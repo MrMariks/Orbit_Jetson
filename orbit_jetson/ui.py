@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSizePolicy,
+    QStackedWidget,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -144,10 +145,13 @@ STYLESHEET = """
     }
     QStatusBar {
         background-color: #161b22;
-        color: #8b949e;
+        color: #e6edf3;
         border-top: 1px solid #30363d;
         padding: 4px 8px;
         font-size: 12px;
+    }
+    QStatusBar QLabel {
+        color: #e6edf3;
     }
 """
 
@@ -160,6 +164,25 @@ except ImportError:
     HAS_MAP = False
     folium = None
     QWebEngineView = None
+
+def _make_loading_page() -> QWidget:
+    """Виджет страницы «Загрузка…» (тот же стиль, что и основное окно)."""
+    page = QWidget()
+    page.setStyleSheet(STYLESHEET)
+    layout = QVBoxLayout(page)
+    layout.setSpacing(20)
+    layout.setContentsMargins(40, 40, 40, 40)
+    layout.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+    title = QLabel("Патрульный модуль")
+    title.setObjectName("titleLabel")
+    layout.addWidget(title)
+    status = QLabel("Подготовка модели распознавания номеров и проверка сервера…")
+    status.setStyleSheet("color: #e6edf3; font-size: 15px;")
+    layout.addWidget(status)
+    hint = QLabel("Интерфейс переключится автоматически по готовности.")
+    hint.setStyleSheet("color: #8b949e; font-size: 13px;")
+    layout.addWidget(hint)
+    return page
 
 
 class CameraThread(QThread):
@@ -219,12 +242,18 @@ class MainWindow(QMainWindow):
         self._sent_plates: dict = {}  # нормализованный номер -> время последней отправки на сервер
         self.setWindowTitle("Orbit_Jetson — Патрульный модуль")
         self.setStyleSheet(STYLESHEET)
+        self._stack: Optional[QStackedWidget] = None
         self._build_ui()
 
+    def show_main_content(self) -> None:
+        """Переключить на основной интерфейс (после загрузки модели и проверки сервера)."""
+        if self._stack is not None:
+            self._stack.setCurrentIndex(1)
+
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        loading_page = _make_loading_page()
+        main_content = QWidget()
+        main_layout = QVBoxLayout(main_content)
         main_layout.setSpacing(16)
         main_layout.setContentsMargins(20, 16, 20, 16)
 
@@ -331,6 +360,12 @@ class MainWindow(QMainWindow):
 
         self._update_map()
 
+        self._stack = QStackedWidget()
+        self._stack.addWidget(loading_page)
+        self._stack.addWidget(main_content)
+        self._stack.setCurrentIndex(0)  # сначала экран загрузки
+        self.setCentralWidget(self._stack)
+
     def _on_camera_open_failed(self):
         self._btn_start.setEnabled(True)
         self._btn_stop.setEnabled(False)
@@ -377,11 +412,12 @@ class MainWindow(QMainWindow):
         def on_plate(text: str, lat, lon, full_image: bytes, crop_image: bytes):
             self._camera_thread.plate_detected.emit(text, lat or 0.0, lon or 0.0, full_image, crop_image)
         self._camera.on_plate_detected = on_plate
+        self._video_label.setText("Открытие камеры…")
+        self._video_label.repaint()
+        self._latest_frame_bytes = None
         self._camera_thread.start()
         self._btn_start.setEnabled(False)
         self._btn_stop.setEnabled(True)
-        self._video_label.setText("")
-        self._latest_frame_bytes = None
         self._update_status_bar()
         # Вывод видео: обновление каждые 25 ms (~40 fps), меньше лагов
         self._display_timer = QTimer(self)

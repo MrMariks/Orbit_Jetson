@@ -40,24 +40,21 @@ class OrbitApiClient:
 
     def check_server(self) -> bool:
         """
-        Проверка доступности бэкенда (GET по base_url).
-        Вызывать при старте мониторинга — тогда в статус-баре сразу будет «Сервер ✓», если API доступен.
+        Проверка доступности бэкенда. При старте мониторинга в статус-баре сразу «Сервер ✓»,
+        не нужно ждать первой детекции.
         """
-        url = self.base_url
-        try:
-            r = self._session.get(url, timeout=min(5, self.timeout))
-            if r.ok:
+        for path in ("/", "/docs", "/api/v1"):
+            url = self.base_url + path
+            try:
+                r = self._session.get(url, timeout=min(5, self.timeout))
+                # Любой ответ = сервер доступен (200, 404, 405 — главное что отвечает)
                 self._server_reachable = True
-                logger.info("Сервер доступен: %s", url)
+                logger.info("Сервер доступен: %s (проверка %s)", self.base_url, path or "/")
                 return True
-            # 404 на корне — часто норма для API; считаем сервер доступным
-            if r.status_code == 404:
-                self._server_reachable = True
-                return True
-            return False
-        except requests.RequestException as e:
-            logger.debug("Сервер недоступен %s: %s", url, e)
-            return False
+            except requests.RequestException:
+                continue
+        logger.debug("Сервер недоступен: %s", self.base_url)
+        return False
 
     def _request(self, method: str, path: str, json: Optional[Dict[str, Any]] = None) -> bool:
         """Выполняет запрос. Возвращает True при успехе."""

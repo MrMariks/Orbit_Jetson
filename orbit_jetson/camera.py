@@ -30,11 +30,19 @@ from .config import (
     ALPR_MIN_BBOX_HEIGHT,
     ALPR_MIN_BBOX_AREA,
     ALPR_ALLOW_EU,
+    ALPR_HIGH_CONF_ADD_AT_ONCE,
+    DRAW_OBJECT_BOXES,
+    ALPR_DEFAULT_LABEL,
+    ALPR_UPSCALING,
+    ALPR_JPEG_QUALITY,
 )
 
 IS_WINDOWS = sys.platform == "win32"
 # На Windows виртуальные камеры (Iriun, OBS) часто лучше работают с MSMF
 CAP_MSMF = getattr(cv2, "CAP_MSMF", -1)
+# Скрыть предупреждения OpenCV «can't be used to capture by index» при переборе камер (всё равно пробуем следующий индекс)
+if getattr(cv2, "setLogLevel", None) is not None:
+    cv2.setLogLevel(3)  # 3 = LOG_LEVEL_ERROR, без WARNING
 logger = logging.getLogger(__name__)
 
 # Форматы госномеров: 000AAA00 (цифры-буквы-цифры) или A000AAA (буква-цифры-буквы)
@@ -48,6 +56,26 @@ def normalize_plate(text: str) -> str:
     """Очистка: только буквы и цифры, верхний регистр."""
     t = PLATE_CLEAN.sub("", text).strip().upper()
     return t
+
+
+def _fix_plate_ocr(text: str) -> str:
+    """Исправление типичных ошибок OCR: O→0, I→1 в позициях цифр (чтобы номера вроде 024AJM14 не терялись)."""
+    if len(text) != 7 and len(text) != 8:
+        return text
+    s = list(text)
+    if len(s) == 8:
+        for i in (0, 1, 2, 6, 7):
+            if s[i] == "O":
+                s[i] = "0"
+            elif s[i] == "I":
+                s[i] = "1"
+    else:
+        for i in (1, 2, 3):
+            if i < len(s) and s[i] == "O":
+                s[i] = "0"
+            elif i < len(s) and s[i] == "I":
+                s[i] = "1"
+    return "".join(s)
 
 
 def _is_likely_garbage(text: str) -> bool:
@@ -121,7 +149,18 @@ def _get_alpr_pipeline():
                 torch.serialization.add_safe_globals(_safe)
             from nomeroff_net import pipeline
             from nomeroff_net.tools import unzip
-            _alpr_pipeline = pipeline("number_plate_detection_and_reading", image_loader="opencv")
+            # Регион/пресет для OCR (как в официальном репо: https://github.com/ria-com/nomeroff-net)
+            default_label = (ALPR_DEFAULT_LABEL or "").strip() or {
+                "KZ": "kz",
+                "RU": "ru",
+                "UA": "eu_ua_2015",
+            }.get((ALPR_COUNTRY_CODE or "KZ").upper(), "eu_ua_2015")
+            _alpr_pipeline = pipeline(
+                "number_plate_detection_and_reading",
+                image_loader="opencv",
+                default_label=default_label,
+                upscaling=ALPR_UPSCALING,
+            )
         global _alpr_loaded
         _alpr_loaded = True
         logger.debug("ALPR включён (nomeroff-net)")
@@ -163,6 +202,31 @@ def _get_alpr_pipeline():
         return None
 
 
+def preload_alpr() -> None:
+    """Предзагрузка модели при запуске приложения. По нажатию «Старт мониторинга» сканирование начнётся сразу."""
+    if _get_alpr_pipeline() is not None:
+        logger.info("ALPR: модель готова, по нажатию «Старт мониторинга» сканирование начнётся сразу")
+
+
+def warmup_camera() -> None:
+    """
+    Коротко открыть и закрыть камеру по индексам 0,1,2 — «прогрев» драйвера.
+    После этого при нажатии «Старт мониторинга» камера часто открывается сразу, без зависания.
+    """
+    from .config import CAMERA_INDEX
+    order = [CAMERA_INDEX] + [i for i in (0, 1, 2) if i != CAMERA_INDEX]
+    for idx in order:
+        try:
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if IS_WINDOWS else cv2.VideoCapture(idx)
+            if cap and cap.isOpened():
+                cap.read()
+                cap.release()
+                logger.debug("Камера: прогрев индекса %s", idx)
+                break
+        except Exception:
+            pass
+
+
 class CameraWorker:
     """
     Захват видео, ALPR (nomeroff-net): рамка номера → полигон → OCR → фильтр.
@@ -199,6 +263,9 @@ class CameraWorker:
         self._allow_eu = ALPR_ALLOW_EU
         self._last_raw_frame: Optional["np.ndarray"] = None
         self._last_raw_frame_lock = threading.Lock()
+        self._last_draw_bboxes: List[Tuple[int, int, int, int]] = []
+        self._last_draw_plate_points: List[List[Tuple[int, int]]] = []
+        self._last_draw_lock = threading.Lock()
         self._alpr_thread: Optional[threading.Thread] = None
         self._alpr_stop = False
         self._alpr_cycle_count = 0
@@ -265,25 +332,26 @@ class CameraWorker:
                 if cap:
                     cap.release()
                 continue
-            time.sleep(0.5 if accept_any_frame else 0.7)
+            # Короткая пауза, чтобы устройство успело отдать первый кадр (раньше было 0.5–0.7 сек)
+            time.sleep(0.15 if accept_any_frame else 0.35)
             if accept_any_frame:
-                # Источник из конфига (телефон/Iriun): принимаем первый же читаемый кадр, не ждём «не чёрный»
-                for _ in range(80):
+                # Источник из конфига (телефон/Iriun): принимаем первый же читаемый кадр
+                for _ in range(100):
                     ret, frame = cap.read()
                     if ret and frame is not None:
                         return cap
-                    time.sleep(0.05)
+                    time.sleep(0.02)  # чаще опрашиваем — картинка появится быстрее
             else:
-                for _ in range(50):
+                for _ in range(40):
                     ret, frame = cap.read()
                     if ret and _frame_is_useful(frame):
                         return cap
-                    time.sleep(0.05)
-                for _ in range(30):
+                    time.sleep(0.03)
+                for _ in range(25):
                     ret, frame = cap.read()
                     if ret and frame is not None:
                         return cap
-                    time.sleep(0.1)
+                    time.sleep(0.05)
             cap.release()
         return None
 
@@ -335,7 +403,7 @@ class CameraWorker:
         self._last_dedup_time = time.time()
         self._first_frame_logged = False
         if IS_WINDOWS and self._cap:
-            time.sleep(0.5)
+            time.sleep(0.2)
             got_useful = False
             for _ in range(40):
                 ret, frame = self._cap.read()
@@ -390,11 +458,20 @@ class CameraWorker:
         try:
             from nomeroff_net.tools import unzip
             if self._alpr_cycle_count == 1:
-                logger.info("ALPR: запуск модели на первом кадре (на CPU может занять 1–2 мин), подождите…")
+                try:
+                    import torch
+                    on_gpu = torch.cuda.is_available()
+                except Exception:
+                    on_gpu = False
+                if on_gpu:
+                    logger.info("ALPR: запуск модели на первом кадре (GPU), подождите…")
+                else:
+                    logger.info("ALPR: запуск модели на первом кадре (CPU, может занять 1–2 мин), подождите…")
                 sys.stdout.flush()
                 sys.stderr.flush()
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                cv2.imwrite(f.name, frame)
+                q = max(1, min(100, int(ALPR_JPEG_QUALITY)))
+                cv2.imwrite(f.name, frame, [cv2.IMWRITE_JPEG_QUALITY, q])
                 path = f.name
             try:
                 result = pipeline_fn([path])
@@ -404,12 +481,39 @@ class CameraWorker:
                         unpacked[1], unpacked[2], unpacked[5], unpacked[7], unpacked[8]
                     )
                 else:
-                    images_points, texts = ([], []), []
+                    images_bboxs, images_points, texts = [], ([], []), []
                     confidences, region_names = [], []
                 points_list = (images_points[0] if images_points and len(images_points) > 0 else [])
                 texts_list = list(texts[0]) if texts and len(texts) > 0 else []
                 conf_list = list(confidences[0]) if confidences and len(confidences) > 0 else []
                 regions_list = list(region_names[0]) if region_names and len(region_names) > 0 else []
+                # Боксы объектов (детекция YOLO) и полигоны номеров для отрисовки в видео
+                draw_bboxes: List[Tuple[int, int, int, int]] = []
+                if images_bboxs and len(images_bboxs) > 0:
+                    bbox_list = images_bboxs[0] if isinstance(images_bboxs[0], (list, tuple)) else []
+                    for box in bbox_list:
+                        try:
+                            if not hasattr(box, "__len__") or len(box) < 4:
+                                continue
+                            if isinstance(box[0], (list, tuple, np.ndarray)) or (hasattr(box[0], "__len__") and not isinstance(box[0], (int, float))):
+                                xs = [int(float(box[j][0])) for j in range(min(4, len(box)))]
+                                ys = [int(float(box[j][1])) for j in range(min(4, len(box)))]
+                            else:
+                                xs = [int(float(box[0])), int(float(box[2]))]
+                                ys = [int(float(box[1])), int(float(box[3]))]
+                            if len(xs) >= 2 and len(ys) >= 2 and max(xs) > min(xs) and max(ys) > min(ys):
+                                draw_bboxes.append((min(xs), min(ys), max(xs), max(ys)))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                draw_plate_points: List[List[Tuple[int, int]]] = []
+                for pts in points_list:
+                    if pts is not None and len(pts) >= 4:
+                        points_xy = [(int(pts[j][0]), int(pts[j][1])) for j in range(min(4, len(pts)))]
+                        if len(points_xy) == 4:
+                            draw_plate_points.append(points_xy)
+                with self._last_draw_lock:
+                    self._last_draw_bboxes = draw_bboxes
+                    self._last_draw_plate_points = draw_plate_points
                 num_raw = len(points_list)
                 passed = 0
                 if self._alpr_cycle_count == 1:
@@ -432,7 +536,11 @@ class CameraWorker:
                                 conf, self._conf_min, text or "(пусто)",
                             )
                         continue
-                    if not text or not looks_like_plate(text, self._allow_eu):
+                    if not text:
+                        continue
+                    if not looks_like_plate(text, self._allow_eu):
+                        text = _fix_plate_ocr(text)
+                    if not looks_like_plate(text, self._allow_eu):
                         continue
                     points_xy = [(int(pts[j][0]), int(pts[j][1])) for j in range(min(4, len(pts)))]
                     xs, ys = [p[0] for p in points_xy], [p[1] for p in points_xy]
@@ -447,13 +555,22 @@ class CameraWorker:
                     raw_region = regions_list[i] if i < len(regions_list) else self._country
                     region = str(raw_region[0] if isinstance(raw_region, (list, tuple)) and raw_region else raw_region) if raw_region else self._country
                     key = normalize_plate(text)
+                    high_conf = conf >= ALPR_HIGH_CONF_ADD_AT_ONCE
                     if key not in self._pending_plates:
-                        self._pending_plates[key] = (self._alpr_cycle_count, now)
+                        if high_conf:
+                            if self._dedup_and_emit(text) and self.on_plate_detected:
+                                zoomed_img = self._crop_zoomed_region(frame, points_xy, expand_factor=2.0)
+                                zoomed_image_bytes = (cv2.imencode(".jpg", zoomed_img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes() if zoomed_img is not None else cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
+                                crop_img = self._crop_plate_region(frame, points_xy)
+                                crop_image_bytes = cv2.imencode(".jpg", crop_img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes() if crop_img is not None else zoomed_image_bytes
+                                self.on_plate_detected(text, self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
+                        else:
+                            self._pending_plates[key] = (self._alpr_cycle_count, now)
                     else:
                         first_cycle, first_time = self._pending_plates[key]
                         if now - first_time > self._confirm_seconds:
                             self._pending_plates[key] = (self._alpr_cycle_count, now)
-                        elif self._alpr_cycle_count - first_cycle >= ALPR_CONFIRM_CYCLES:
+                        elif self._alpr_cycle_count - first_cycle >= ALPR_CONFIRM_CYCLES or high_conf:
                             if self._dedup_and_emit(text) and self.on_plate_detected:
                                 zoomed_img = self._crop_zoomed_region(frame, points_xy, expand_factor=2.0)
                                 zoomed_image_bytes = (cv2.imencode(".jpg", zoomed_img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes() if zoomed_img is not None else cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
@@ -562,6 +679,19 @@ class CameraWorker:
         if not self._first_frame_logged:
             self._first_frame_logged = True
             logger.info("Камера: первый кадр получен (для показа и ALPR)")
+        # Отрисовка боксов детекции и рамок номеров поверх кадра
+        with self._last_draw_lock:
+            bboxes = list(self._last_draw_bboxes)
+            plate_pts = [list(pts) for pts in self._last_draw_plate_points]
+        if (DRAW_OBJECT_BOXES and bboxes) or plate_pts:
+            frame = frame.copy()
+            if DRAW_OBJECT_BOXES:
+                for (x1, y1, x2, y2) in bboxes:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 120, 0), 2)  # синий — бокс детектора
+            for pts in plate_pts:
+                if len(pts) >= 4:
+                    pts_np = np.array(pts, dtype=np.int32)
+                    cv2.polylines(frame, [pts_np], True, (0, 255, 0), 2)  # зелёный — госномер
         h, w = frame.shape[:2]
         max_w = 960
         jpeg_quality = 75
