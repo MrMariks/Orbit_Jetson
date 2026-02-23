@@ -13,4 +13,6 @@ git+https://github.com/ria-com/modelhub-client.git
 folium>=0.12.0
 requests>=2.26.0
 numpy>=1.19.0
+# Для HTTPS приёма геолокации с телефона (самоподписанный сертификат без openssl)
+cryptography>=41.0.0
 # nomeroff-net тянет torch/torchvision при установке

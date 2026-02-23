@@ -1,4 +1,6 @@
 orbit_jetson/api_key.txt
+orbit_jetson/gps/certs/
+recordings/
 venv/
 __pycache__/
 *.py[cod]

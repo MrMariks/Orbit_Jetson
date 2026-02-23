@@ -4,6 +4,7 @@
 Видеопоток, панель распознанных номеров, карта, кнопки Старт/Стоп.
 """
 
+import hashlib
 import logging
 import threading
 import time
@@ -27,7 +28,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .config import MAX_DISPLAYED_PLATES, DETECTION_DEDUP_HOURS
+from .config import MAX_DISPLAYED_PLATES, DETECTION_DEDUP_HOURS, CROP_DEDUP_MINUTES
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,27 @@ STYLESHEET = """
         background-color: #b62324;
     }
     QPushButton#btnStop:disabled {
+        background-color: #21262d;
+        color: #6e7681;
+    }
+    QPushButton#btnRecord {
+        background-color: #d4a72c;
+        color: #0d1117;
+        border: 2px solid #f0c674;
+        border-radius: 8px;
+        padding: 12px 24px;
+        font-size: 14px;
+        font-weight: 700;
+    }
+    QPushButton#btnRecord:hover {
+        background-color: #e6b82e;
+        color: #0d1117;
+    }
+    QPushButton#btnRecord:pressed {
+        background-color: #b8921f;
+        color: #0d1117;
+    }
+    QPushButton#btnRecord:disabled {
         background-color: #21262d;
         color: #6e7681;
     }
@@ -339,8 +361,15 @@ class MainWindow(QMainWindow):
         self._btn_stop.setCursor(Qt.PointingHandCursor)
         self._btn_stop.clicked.connect(self._on_stop)
         self._btn_stop.setEnabled(False)
+        self._btn_record = QPushButton("●  Запись")
+        self._btn_record.setObjectName("btnRecord")
+        self._btn_record.setToolTip("Сохранять видео с рамками на номерах для последующего анализа")
+        self._btn_record.setCursor(Qt.PointingHandCursor)
+        self._btn_record.clicked.connect(self._on_toggle_record)
+        self._btn_record.setEnabled(False)
         btn_layout.addWidget(self._btn_start, 0, 0)
         btn_layout.addWidget(self._btn_stop, 0, 1)
+        btn_layout.addWidget(self._btn_record, 0, 2)
         content.addLayout(btn_layout, 2, 0, 1, 2)
 
         main_layout.addLayout(content)
@@ -369,6 +398,7 @@ class MainWindow(QMainWindow):
     def _on_camera_open_failed(self):
         self._btn_start.setEnabled(True)
         self._btn_stop.setEnabled(False)
+        self._btn_record.setEnabled(False)
         self._video_label.setText("Ошибка: не удалось открыть камеру.\nЗакройте окно Iriun Webcam на ПК и нажмите «Старт» снова.")
         self._update_status_bar()
 
@@ -418,6 +448,8 @@ class MainWindow(QMainWindow):
         self._camera_thread.start()
         self._btn_start.setEnabled(False)
         self._btn_stop.setEnabled(True)
+        self._btn_record.setEnabled(True)
+        self._btn_record.setText("●  Запись")
         self._update_status_bar()
         # Вывод видео: обновление каждые 25 ms (~40 fps), меньше лагов
         self._display_timer = QTimer(self)
@@ -431,6 +463,9 @@ class MainWindow(QMainWindow):
             self._display_timer.stop()
             self._display_timer = None
         self._latest_frame_bytes = None
+        self._camera.stop_recording()
+        self._btn_record.setEnabled(False)
+        self._btn_record.setText("●  Запись")
         if self._camera_thread:
             self._camera_thread.stop()
             self._camera_thread.wait(3000)
@@ -439,6 +474,20 @@ class MainWindow(QMainWindow):
         self._btn_stop.setEnabled(False)
         self._video_label.setText("Видеопоток\nЗапустите мониторинг")
         self._update_status_bar()
+
+    def _on_toggle_record(self):
+        if self._camera.is_recording():
+            path = self._camera.stop_recording()
+            self._btn_record.setText("●  Запись")
+            if path:
+                self.setStatusTip(f"Запись сохранена: {path}")
+        else:
+            path = self._camera.start_recording()
+            if path:
+                self._btn_record.setText("■  Стоп запись")
+                self.setStatusTip(f"Запись: {path}")
+            else:
+                self.setStatusTip("Не удалось начать запись")
 
     def _on_frame(self, jpeg_bytes: bytes):
         """Сохраняем последний кадр; отрисовка по таймеру для плавности."""
@@ -456,23 +505,31 @@ class MainWindow(QMainWindow):
 
     def _on_plate(self, plate: str, lat: float, lon: float, full_image: bytes, crop_image: bytes):
         ts = time.strftime("%H:%M:%S", time.localtime())
-        item = QListWidgetItem(f"{plate}  —  {ts}")
+        display_text = plate if plate else "— (на сервере)"
+        item = QListWidgetItem(f"{display_text}  —  {ts}")
         self._plates_list.insertItem(0, item)
         while self._plates_list.count() > MAX_DISPLAYED_PLATES:
             self._plates_list.takeItem(self._plates_list.count() - 1)
-        key = plate.strip().upper().replace(" ", "")
+        if plate:
+            key = plate.strip().upper().replace(" ", "")
+            dedup_sec = DETECTION_DEDUP_HOURS * 3600
+        else:
+            key = "crop:" + hashlib.sha256(crop_image).hexdigest()[:16]
+            dedup_sec = CROP_DEDUP_MINUTES * 60
         now = time.time()
-        dedup_sec = DETECTION_DEDUP_HOURS * 3600
         if key in self._sent_plates and (now - self._sent_plates[key]) < dedup_sec:
-            logger.info("[Сервер] Пропуск: номер %s уже отправлялся в последние %s ч, на сервер не шлём", plate, DETECTION_DEDUP_HOURS)
+            logger.info("[Сервер] Пропуск дубликата: уже отправлялось (ключ %s), на сервер не шлём", key[:20] + "…" if len(key) > 20 else key)
         else:
             self._sent_plates[key] = now
-            logger.info("[Сервер] Обнаружен номер %s — отправляю на сервер", plate)
+            logger.info("[Сервер] Обнаружен номер %s — отправляю на сервер", display_text)
             ok = self._api.send_detection(plate, full_image, crop_image)
             if not ok:
-                logger.warning("[Сервер] Отправка не удалась для номера %s (см. сообщения выше)", plate)
+                logger.warning("[Сервер] Отправка не удалась для номера %s (см. сообщения выше)", display_text)
+            plate_dedup_sec = DETECTION_DEDUP_HOURS * 3600
+            crop_dedup_sec = CROP_DEDUP_MINUTES * 60
             for k in list(self._sent_plates):
-                if now - self._sent_plates[k] > dedup_sec * 2:
+                limit = crop_dedup_sec * 2 if k.startswith("crop:") else plate_dedup_sec * 2
+                if now - self._sent_plates[k] > limit:
                     del self._sent_plates[k]
         pos = self._gps.get_position()
         self._camera.set_gps(pos.latitude, pos.longitude)
