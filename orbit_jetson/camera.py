@@ -35,6 +35,7 @@ from .config import (
     ALPR_DEFAULT_LABEL,
     ALPR_UPSCALING,
     ALPR_JPEG_QUALITY,
+    ALPR_INPUT_MIN_WIDTH,
 )
 
 IS_WINDOWS = sys.platform == "win32"
@@ -469,9 +470,21 @@ class CameraWorker:
                     logger.info("ALPR: запуск модели на первом кадре (CPU, может занять 1–2 мин), подождите…")
                 sys.stdout.flush()
                 sys.stderr.flush()
+            h_orig, w_orig = frame.shape[:2]
+            alpr_frame = frame
+            scale_to_orig_x = 1.0
+            scale_to_orig_y = 1.0
+            min_w = max(0, int(ALPR_INPUT_MIN_WIDTH))
+            if min_w > 0 and w_orig < min_w:
+                scale = min_w / float(w_orig)
+                w_alpr = min_w
+                h_alpr = int(round(h_orig * scale))
+                alpr_frame = cv2.resize(frame, (w_alpr, h_alpr), interpolation=cv2.INTER_LINEAR)
+                scale_to_orig_x = w_orig / float(w_alpr)
+                scale_to_orig_y = h_orig / float(h_alpr)
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
                 q = max(1, min(100, int(ALPR_JPEG_QUALITY)))
-                cv2.imwrite(f.name, frame, [cv2.IMWRITE_JPEG_QUALITY, q])
+                cv2.imwrite(f.name, alpr_frame, [cv2.IMWRITE_JPEG_QUALITY, q])
                 path = f.name
             try:
                 result = pipeline_fn([path])
@@ -511,6 +524,16 @@ class CameraWorker:
                         points_xy = [(int(pts[j][0]), int(pts[j][1])) for j in range(min(4, len(pts)))]
                         if len(points_xy) == 4:
                             draw_plate_points.append(points_xy)
+                if scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0:
+                    draw_bboxes = [
+                        (int(x1 * scale_to_orig_x), int(y1 * scale_to_orig_y),
+                         int(x2 * scale_to_orig_x), int(y2 * scale_to_orig_y))
+                        for (x1, y1, x2, y2) in draw_bboxes
+                    ]
+                    draw_plate_points = [
+                        [(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in pts]
+                        for pts in draw_plate_points
+                    ]
                 with self._last_draw_lock:
                     self._last_draw_bboxes = draw_bboxes
                     self._last_draw_plate_points = draw_plate_points
@@ -543,6 +566,10 @@ class CameraWorker:
                     if not looks_like_plate(text, self._allow_eu):
                         continue
                     points_xy = [(int(pts[j][0]), int(pts[j][1])) for j in range(min(4, len(pts)))]
+                    if scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0:
+                        points_xy_orig = [(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in points_xy]
+                    else:
+                        points_xy_orig = points_xy
                     xs, ys = [p[0] for p in points_xy], [p[1] for p in points_xy]
                     w, h = max(xs) - min(xs), max(ys) - min(ys)
                     if h <= 0 or w <= 0:
@@ -559,9 +586,9 @@ class CameraWorker:
                     if key not in self._pending_plates:
                         if high_conf:
                             if self._dedup_and_emit(text) and self.on_plate_detected:
-                                zoomed_img = self._crop_zoomed_region(frame, points_xy, expand_factor=2.0)
+                                zoomed_img = self._crop_zoomed_region(frame, points_xy_orig, expand_factor=2.0)
                                 zoomed_image_bytes = (cv2.imencode(".jpg", zoomed_img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes() if zoomed_img is not None else cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
-                                crop_img = self._crop_plate_region(frame, points_xy)
+                                crop_img = self._crop_plate_region(frame, points_xy_orig)
                                 crop_image_bytes = cv2.imencode(".jpg", crop_img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes() if crop_img is not None else zoomed_image_bytes
                                 self.on_plate_detected(text, self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
                         else:
@@ -572,9 +599,9 @@ class CameraWorker:
                             self._pending_plates[key] = (self._alpr_cycle_count, now)
                         elif self._alpr_cycle_count - first_cycle >= ALPR_CONFIRM_CYCLES or high_conf:
                             if self._dedup_and_emit(text) and self.on_plate_detected:
-                                zoomed_img = self._crop_zoomed_region(frame, points_xy, expand_factor=2.0)
+                                zoomed_img = self._crop_zoomed_region(frame, points_xy_orig, expand_factor=2.0)
                                 zoomed_image_bytes = (cv2.imencode(".jpg", zoomed_img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes() if zoomed_img is not None else cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
-                                crop_img = self._crop_plate_region(frame, points_xy)
+                                crop_img = self._crop_plate_region(frame, points_xy_orig)
                                 crop_image_bytes = cv2.imencode(".jpg", crop_img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes() if crop_img is not None else zoomed_image_bytes
                                 self.on_plate_detected(text, self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
                             del self._pending_plates[key]
