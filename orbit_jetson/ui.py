@@ -157,6 +157,22 @@ STYLESHEET = """
         background-color: #21262d;
         color: #6e7681;
     }
+    QPushButton#btnExit {
+        background-color: #30363d;
+        color: #e6edf3;
+        border: 2px solid #484f58;
+        border-radius: 8px;
+        padding: 12px 24px;
+        font-size: 14px;
+        font-weight: 700;
+    }
+    QPushButton#btnExit:hover {
+        background-color: #484f58;
+        color: #fff;
+    }
+    QPushButton#btnExit:pressed {
+        background-color: #21262d;
+    }
     QLabel#mapPlaceholder {
         background-color: #0d1117;
         border: 1px solid #30363d;
@@ -367,9 +383,15 @@ class MainWindow(QMainWindow):
         self._btn_record.setCursor(Qt.PointingHandCursor)
         self._btn_record.clicked.connect(self._on_toggle_record)
         self._btn_record.setEnabled(False)
+        self._btn_exit = QPushButton("Выход")
+        self._btn_exit.setObjectName("btnExit")
+        self._btn_exit.setCursor(Qt.PointingHandCursor)
+        self._btn_exit.setToolTip("Закрыть ПО и сообщить серверу о завершении патруля")
+        self._btn_exit.clicked.connect(self._on_exit)
         btn_layout.addWidget(self._btn_start, 0, 0)
         btn_layout.addWidget(self._btn_stop, 0, 1)
         btn_layout.addWidget(self._btn_record, 0, 2)
+        btn_layout.addWidget(self._btn_exit, 0, 3)
         content.addLayout(btn_layout, 2, 0, 1, 2)
 
         main_layout.addLayout(content)
@@ -457,6 +479,8 @@ class MainWindow(QMainWindow):
         self._display_timer.start(25)
         # Проверка доступности сервера в фоне — тогда в статус-баре сразу «Сервер ✓»
         threading.Thread(target=self._api.check_server, daemon=True).start()
+        # Уведомление сервера: патруль активен
+        threading.Thread(target=self._api.send_patrol_active, daemon=True).start()
 
     def _on_stop(self):
         if self._display_timer:
@@ -474,6 +498,13 @@ class MainWindow(QMainWindow):
         self._btn_stop.setEnabled(False)
         self._video_label.setText("Видеопоток\nЗапустите мониторинг")
         self._update_status_bar()
+
+    def _on_exit(self):
+        """Остановить мониторинг, сообщить серверу о завершении патруля и закрыть приложение."""
+        if self._camera.is_running():
+            self._on_stop()
+        self._api.send_patrol_finish()
+        QApplication.instance().quit()
 
     def _on_toggle_record(self):
         if self._camera.is_recording():

@@ -75,6 +75,20 @@ class OrbitApiClient:
             logger.exception("API request failed: %s", e)
             return False
 
+    def send_patrol_active(self) -> bool:
+        """Патруль запустился: POST /api/v1/patrol/active (Authorization: Bearer)."""
+        ok = self._request("POST", "/api/v1/patrol/active", json={})
+        if ok:
+            logger.info("Сервер: патруль отмечен как активный")
+        return ok
+
+    def send_patrol_finish(self) -> bool:
+        """Патруль завершил работу: POST /api/v1/patrol/finish (Authorization: Bearer)."""
+        ok = self._request("POST", "/api/v1/patrol/finish", json={})
+        if ok:
+            logger.info("Сервер: патруль отмечен как неактивный (завершение)")
+        return ok
+
     def send_telemetry(self, position: GpsPosition) -> bool:
         """
         Отправляет телеметрию на POST /api/v1/patrol/telemetry (без координат, высоты и скорости).
