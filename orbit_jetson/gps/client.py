@@ -5,6 +5,7 @@
 """
 
 import logging
+import socket
 import ssl
 import subprocess
 import threading
@@ -41,6 +42,17 @@ class GpsPosition:
     altitude: Optional[float] = None
     speed_kmh: Optional[float] = None
     timestamp: Optional[str] = None
+
+
+def _get_local_ip() -> Optional[str]:
+    """Локальный IP в текущей сети (Wi‑Fi/раздача)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.5)
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return None
 
 
 def _create_cert_with_cryptography(cert_file: Path, key_file: Path) -> bool:
@@ -180,10 +192,9 @@ def _run_http_gps_server(port: int, on_position: Callable[[float, float], None])
             scheme = "https"
         else:
             scheme = "http"
-        logger.info(
-            "GPS: приём координат на порту %s (%s). Откройте на телефоне: %s://IP_ПК:%s/",
-            port, scheme.upper(), scheme, port,
-        )
+        local_ip = _get_local_ip() or "IP_ПК"
+        url = "%s://%s:%s/" % (scheme, local_ip, port)
+        logger.info("GPS: приём на порту %s (%s). На телефоне откройте: %s", port, scheme.upper(), url)
         server.serve_forever()
     except Exception as e:
         logger.warning("GPS HTTP сервер: %s", e)
