@@ -25,11 +25,10 @@ except ImportError:
 from .config import (
     DEFAULT_LAT,
     DEFAULT_LON,
+    GPS_HTTP_CERT_DIR,
     GPS_HTTP_PORT,
+    GPS_HTTP_USE_HTTPS,
 )
-
-GPS_HTTP_USE_HTTPS = False
-GPS_HTTP_CERT_DIR = ""
 
 logger = logging.getLogger(__name__)
 
