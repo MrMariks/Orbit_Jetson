@@ -10,6 +10,8 @@ import threading
 import time
 from typing import Optional
 
+import cv2
+import numpy as np
 from PyQt5.QtCore import QByteArray, QThread, pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
@@ -28,9 +30,25 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .config import MAX_DISPLAYED_PLATES, DETECTION_DEDUP_HOURS, CROP_DEDUP_MINUTES
+from .config import MAX_DISPLAYED_PLATES, DETECTION_DEDUP_HOURS, CROP_DEDUP_MINUTES, TELEMETRY_INTERVAL_SEC, POSITION_INTERVAL_SEC
 
 logger = logging.getLogger(__name__)
+
+
+def _crop_fingerprint(crop_image: bytes) -> str:
+    """Индекс кропа: один и тот же номер в разных кадрах даёт один ключ — не слать дубликаты."""
+    try:
+        buf = np.frombuffer(crop_image, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+        if img is None or img.size == 0:
+            return hashlib.sha256(crop_image).hexdigest()[:16]
+        small = cv2.resize(img, (8, 8))
+        med = np.median(small)
+        bits = (small.ravel() > med).astype(np.uint8).tobytes()
+        return hashlib.sha256(bits).hexdigest()[:16]
+    except Exception:
+        return hashlib.sha256(crop_image).hexdigest()[:16]
+
 
 # Стили приложения: тёмная тема «патрульный модуль»
 STYLESHEET = """
@@ -407,6 +425,12 @@ class MainWindow(QMainWindow):
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_status_bar)
         self._status_timer.start(2000)
+        self._position_timer = QTimer(self)
+        self._position_timer.timeout.connect(self._send_position)
+        self._telemetry_timer = QTimer(self)
+        self._telemetry_timer.timeout.connect(self._send_telemetry)
+
+        # Таймер обновления статуса (раз в 2 сек)
         self._update_status_bar()
 
         self._update_map()
@@ -451,7 +475,15 @@ class MainWindow(QMainWindow):
         self._status_label.setText(status_str)
         if status_str != self._last_status_str:
             self._last_status_str = status_str
-            logger.info("Статус: %s", status_str)
+            # В лог — одна строка да/нет по 5 модулям
+            log_str = "ПО %s | Модель %s | Сервер %s | Камера %s | GPS %s" % (
+                "да" if "ПО ✓" in s_po else "нет",
+                "да" if s_model.startswith("Модель ✓") else "нет",
+                "да" if s_server.startswith("Сервер ✓") else "нет",
+                "да" if s_cam.startswith("Камера ✓") else "нет",
+                "да" if s_gps.startswith("GPS ✓") else "нет",
+            )
+            logger.info(log_str)
 
     def _on_start(self):
         # Камера открывается внутри CameraThread (нужно для Iriun)
@@ -477,6 +509,8 @@ class MainWindow(QMainWindow):
         self._display_timer = QTimer(self)
         self._display_timer.timeout.connect(self._paint_latest_frame)
         self._display_timer.start(25)
+        self._position_timer.start(int(POSITION_INTERVAL_SEC * 1000))
+        self._telemetry_timer.start(int(TELEMETRY_INTERVAL_SEC * 1000))
         # Проверка доступности сервера в фоне — тогда в статус-баре сразу «Сервер ✓»
         threading.Thread(target=self._api.check_server, daemon=True).start()
         # Уведомление сервера: патруль активен
@@ -486,6 +520,8 @@ class MainWindow(QMainWindow):
         if self._display_timer:
             self._display_timer.stop()
             self._display_timer = None
+        self._position_timer.stop()
+        self._telemetry_timer.stop()
         self._latest_frame_bytes = None
         self._camera.stop_recording()
         self._btn_record.setEnabled(False)
@@ -541,11 +577,12 @@ class MainWindow(QMainWindow):
         self._plates_list.insertItem(0, item)
         while self._plates_list.count() > MAX_DISPLAYED_PLATES:
             self._plates_list.takeItem(self._plates_list.count() - 1)
-        if plate:
+        # Дедуп по тексту номера или по хешу кропа (для «не удалось распознать» и пустого)
+        if plate and plate.strip() and plate.strip() != "не удалось распознать":
             key = plate.strip().upper().replace(" ", "")
             dedup_sec = DETECTION_DEDUP_HOURS * 3600
         else:
-            key = "crop:" + hashlib.sha256(crop_image).hexdigest()[:16]
+            key = "crop:" + _crop_fingerprint(crop_image)
             dedup_sec = CROP_DEDUP_MINUTES * 60
         now = time.time()
         if key in self._sent_plates and (now - self._sent_plates[key]) < dedup_sec:
@@ -570,6 +607,18 @@ class MainWindow(QMainWindow):
         self._api.send_telemetry(pos)
         self._camera.set_gps(pos.latitude, pos.longitude)
         self._update_map(lat=pos.latitude, lon=pos.longitude)
+
+    def _send_position(self):
+        """Отправка координат патруля на POST /api/v1/patrol/position для иконки на карте."""
+        pos = self._gps.get_position()
+        lat, lon = pos.latitude, pos.longitude
+        if lat is None or lon is None:
+            return
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return
+        self._api.send_patrol_position(lat, lon)
+        self._camera.set_gps(lat, lon)
+        self._update_map(lat=lat, lon=lon)
 
     def _update_map(self, lat: float = None, lon: float = None):
         if not HAS_MAP or not folium:

@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Union
 
 import requests
 
-from .config import API_TOKEN, BACKEND_URL, PATROL_LICENSE_PLATE
+from .config import API_TOKEN, BACKEND_URL
 from .gps import GpsPosition
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ class OrbitApiClient:
                 r = self._session.get(url, timeout=min(5, self.timeout))
                 # Любой ответ = сервер доступен (200, 404, 405 — главное что отвечает)
                 self._server_reachable = True
-                logger.info("Сервер доступен: %s (проверка %s)", self.base_url, path or "/")
+                logger.debug("Сервер %s", self.base_url)
                 return True
             except requests.RequestException:
                 continue
@@ -89,12 +89,23 @@ class OrbitApiClient:
             logger.info("Сервер: патруль отмечен как неактивный (завершение)")
         return ok
 
+    def send_patrol_position(self, latitude: float, longitude: float) -> bool:
+        """
+        Отправляет координаты патруля на POST /api/v1/patrol/position для отображения иконки на карте.
+        Заголовок: Authorization: Bearer <API_KEY>, тело: {"latitude": float, "longitude": float}.
+        """
+        payload = {"latitude": float(latitude), "longitude": float(longitude)}
+        ok = self._request("POST", "/api/v1/patrol/position", json=payload)
+        if ok:
+            logger.debug("Сервер: координаты патруля отправлены (%.5f, %.5f)", latitude, longitude)
+        return ok
+
     def send_telemetry(self, position: GpsPosition) -> bool:
         """
-        Отправляет телеметрию на POST /api/v1/patrol/telemetry (без координат, высоты и скорости).
+        Отправляет телеметрию на POST /api/v1/patrol/telemetry.
+        Патруль определяется по API-токену (Authorization: Bearer).
         """
         payload = {
-            "license_plate": PATROL_LICENSE_PLATE.strip(),
             "timestamp": position.timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         ok = self._request("POST", "/api/v1/patrol/telemetry", json=payload)

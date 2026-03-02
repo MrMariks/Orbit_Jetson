@@ -44,7 +44,7 @@ warnings.filterwarnings("ignore", message=".*Creating a tensor from a list.*")
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QApplication
 
-from .config import CAMERA_INDEX, PHONE_IP, GPS_PORT, ALPR_USE_CPU
+from .config import CAMERA_INDEX
 from .api_client import OrbitApiClient
 from .gps import get_gps
 from .camera import CameraWorker, preload_alpr, warmup_camera
@@ -65,12 +65,7 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logger = logging.getLogger("orbit_jetson")
-    logger.info("Orbit_Jetson starting")
-    logger.info("Камера: индекс %s (по «Старт мониторинга» — сразу видео и сканирование)", CAMERA_INDEX)
-    logger.info("GPS: подключение к %s:%s (статус в консоли при подключении/обрыве)", PHONE_IP, GPS_PORT)
-    logger.info("ALPR: подготовка при запуске — основное окно откроется по готовности")
-    if ALPR_USE_CPU:
-        logger.info("ALPR: вычисления на CPU (ALPR_USE_CPU=True)")
+    logger.info("Старт программы")
 
     api = OrbitApiClient()
     gps = get_gps()
@@ -94,7 +89,14 @@ def main():
     def on_loading_check():
         if loading_done[0]:
             win.show_main_content()
-            logger.info("Приложение готово к работе")
+            # Один лог по 5 модулям: да/нет
+            server_ok = getattr(api, "_server_reachable", False)
+            gps_ok = getattr(gps, "is_connected", lambda: False)()
+            logger.info(
+                "ПО да | Модель да | Сервер %s | Камера нет | GPS %s",
+                "да" if server_ok else "нет",
+                "да" if gps_ok else "нет",
+            )
             return
         QTimer.singleShot(350, on_loading_check)
 

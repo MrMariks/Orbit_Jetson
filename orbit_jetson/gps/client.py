@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Клиент GPS: TCP NMEA и опционально приём по HTTP.
+Клиент GPS: приём координат только через браузер (HTTP).
+На телефоне открываете страницу, даёте доступ к геолокации — координаты уходят на ПК.
 """
 
 import logging
-import re
-import socket
 import ssl
 import subprocess
 import threading
@@ -22,213 +21,26 @@ except ImportError:
     HTTPServer = None  # type: ignore
     parse_qs = urlparse = None
 
-from ..config import (
+from .config import (
     DEFAULT_LAT,
     DEFAULT_LON,
     GPS_HTTP_PORT,
-    GPS_HTTP_USE_HTTPS,
-    GPS_HTTP_CERT_DIR,
-    GPS_PORT,
-    PHONE_IP,
 )
+
+GPS_HTTP_USE_HTTPS = False
+GPS_HTTP_CERT_DIR = ""
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class GpsPosition:
-    """Координаты и метаданные от GPS."""
+    """Координаты от GPS (браузер)."""
     latitude: float
     longitude: float
     altitude: Optional[float] = None
     speed_kmh: Optional[float] = None
     timestamp: Optional[str] = None
-
-
-def _nmea_to_decimal(nmea: str, direction: str) -> Optional[float]:
-    """Конвертация NMEA (градусы+минуты) в десятичные градусы."""
-    if not nmea or nmea == "":
-        return None
-    try:
-        dot = nmea.index(".")
-        deg = int(nmea[: dot - 2])  # градусы
-        minutes = float(nmea[dot - 2 :])
-        value = deg + minutes / 60.0
-        if direction in ("S", "W"):
-            value = -value
-        return value
-    except (ValueError, IndexError):
-        return None
-
-
-def _parse_gprmc(line: str) -> Optional[tuple]:
-    """Парсит $GPRMC: возвращает (lat, lon) или None."""
-    if not line.startswith("$GPRMC") and not line.startswith("$GNRMC"):
-        return None
-    parts = line.split(",")
-    if len(parts) < 10:
-        return None
-    status = parts[2]
-    if status != "A":  # A = valid
-        return None
-    lat = _nmea_to_decimal(parts[3], parts[4] if len(parts) > 4 else "N")
-    lon = _nmea_to_decimal(parts[5], parts[6] if len(parts) > 6 else "E")
-    if lat is not None and lon is not None:
-        return (lat, lon)
-    return None
-
-
-def _parse_gpgga(line: str) -> Optional[tuple]:
-    """Парсит $GPGGA: возвращает (lat, lon) или None."""
-    if not line.startswith("$GPGGA") and not line.startswith("$GNGGA"):
-        return None
-    parts = line.split(",")
-    if len(parts) < 9:
-        return None
-    fix = parts[6]
-    if not fix or int(fix) == 0:
-        return None
-    lat = _nmea_to_decimal(parts[2], parts[3] if len(parts) > 3 else "N")
-    lon = _nmea_to_decimal(parts[4], parts[5] if len(parts) > 5 else "E")
-    if lat is not None and lon is not None:
-        return (lat, lon)
-    return None
-
-
-def _parse_nmea_line(line: str) -> Optional[tuple]:
-    """Парсит одну NMEA-строку, возвращает (lat, lon) или None."""
-    line = line.strip()
-    if not line:
-        return None
-    if "*" in line:
-        line = line.split("*")[0]
-    return _parse_gprmc(line) or _parse_gpgga(line)
-
-
-class NetworkGps:
-    """
-    Сокет-клиент: подключается к телефону по TCP, читает NMEA,
-    парсит GPRMC/GPGGA и отдаёт текущие координаты.
-    """
-
-    def __init__(
-        self,
-        host: str = None,
-        port: int = None,
-        default_lat: float = None,
-        default_lon: float = None,
-        reconnect_interval: float = 5.0,
-        recv_timeout: float = 2.0,
-    ):
-        self._host = host or PHONE_IP
-        self._port = port or GPS_PORT
-        self._default_lat = default_lat if default_lat is not None else DEFAULT_LAT
-        self._default_lon = default_lon if default_lon is not None else DEFAULT_LON
-        self._reconnect_interval = reconnect_interval
-        self._recv_timeout = recv_timeout
-        self._lock = threading.Lock()
-        self._last_position = GpsPosition(
-            latitude=self._default_lat,
-            longitude=self._default_lon,
-        )
-        self._connected = False
-        self._sock: Optional[socket.socket] = None
-        self._thread: Optional[threading.Thread] = None
-        self._stop = False
-        self._start_reader()
-
-    def _start_reader(self) -> None:
-        self._stop = False
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
-
-    def _read_loop(self) -> None:
-        buffer = b""
-        while not self._stop:
-            try:
-                if self._sock is None:
-                    self._connect()
-                    if self._sock is None:
-                        time.sleep(self._reconnect_interval)
-                        continue
-                self._sock.settimeout(self._recv_timeout)
-                data = self._sock.recv(4096)
-                if not data:
-                    self._disconnect()
-                    continue
-                buffer += data
-                while b"\r" in buffer or b"\n" in buffer:
-                    line, sep, rest = buffer.partition(b"\n")
-                    if not sep:
-                        line, sep, rest = buffer.partition(b"\r")
-                    buffer = rest
-                    try:
-                        text = line.decode("ascii", errors="ignore")
-                    except Exception:
-                        continue
-                    coords = _parse_nmea_line(text)
-                    if coords:
-                        with self._lock:
-                            self._last_position = GpsPosition(
-                                latitude=coords[0],
-                                longitude=coords[1],
-                            )
-                            self._connected = True
-            except socket.timeout:
-                continue
-            except (ConnectionResetError, BrokenPipeError, OSError) as e:
-                logger.debug("GPS connection error: %s", e)
-                self._disconnect()
-            except Exception as e:
-                logger.debug("GPS read error: %s", e)
-                self._disconnect()
-            if self._sock is None:
-                time.sleep(self._reconnect_interval)
-        self._disconnect()
-
-    def _connect(self) -> None:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0)
-            s.connect((self._host, self._port))
-            self._sock = s
-            self._connected = True
-            logger.info("GPS: Connected (%s:%s)", self._host, self._port)
-        except Exception as e:
-            logger.debug("GPS connect failed %s:%s: %s", self._host, self._port, e)
-            self._sock = None
-            self._connected = False
-
-    def _disconnect(self) -> None:
-        was_connected = self._connected
-        if self._sock:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
-            self._sock = None
-        self._connected = False
-        if was_connected:
-            logger.info("GPS: Disconnected")
-
-    def get_position(self) -> GpsPosition:
-        with self._lock:
-            return GpsPosition(
-                latitude=self._last_position.latitude,
-                longitude=self._last_position.longitude,
-                altitude=self._last_position.altitude,
-                speed_kmh=self._last_position.speed_kmh,
-                timestamp=self._last_position.timestamp,
-            )
-
-    def is_connected(self) -> bool:
-        return self._connected
-
-    def stop(self) -> None:
-        self._stop = True
-        self._disconnect()
-        if self._thread:
-            self._thread.join(timeout=3.0)
 
 
 def _create_cert_with_cryptography(cert_file: Path, key_file: Path) -> bool:
@@ -263,7 +75,7 @@ def _create_cert_with_cryptography(cert_file: Path, key_file: Path) -> bool:
 
 
 def _get_or_create_cert_dir() -> Optional[Path]:
-    """Возвращает каталог с cert.pem и key.pem; при необходимости создаёт их (openssl или cryptography)."""
+    """Возвращает каталог с cert.pem и key.pem для HTTPS (если нужен)."""
     cert_dir = (GPS_HTTP_CERT_DIR or "").strip()
     if cert_dir:
         path = Path(cert_dir)
@@ -274,7 +86,6 @@ def _get_or_create_cert_dir() -> Optional[Path]:
     key_file = path / "key.pem"
     if cert_file.is_file() and key_file.is_file():
         return path
-    # Сначала пробуем openssl
     try:
         subprocess.run(
             [
@@ -286,22 +97,18 @@ def _get_or_create_cert_dir() -> Optional[Path]:
             capture_output=True,
             timeout=30,
         )
-        logger.info("GPS HTTPS: созданы самоподписанные сертификаты в %s (openssl)", path)
+        logger.info("GPS HTTPS: созданы сертификаты в %s", path)
         return path
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    # Fallback: создаём через Python (cryptography)
     if _create_cert_with_cryptography(cert_file, key_file):
-        logger.info("GPS HTTPS: созданы самоподписанные сертификаты в %s (cryptography)", path)
+        logger.info("GPS HTTPS: созданы сертификаты в %s (cryptography)", path)
         return path
-    logger.warning(
-        "GPS HTTPS: не удалось создать сертификаты (нужен openssl в PATH или pip install cryptography). Запуск по HTTP."
-    )
     return None
 
 
 def _run_http_gps_server(port: int, on_position: Callable[[float, float], None]) -> None:
-    """HTTP(S)-сервер: GET /?lat=...&lon=... или GET / для страницы с запросом геолокации."""
+    """HTTP(S)-сервер: GET /?lat=...&lon=... или GET / — страница с запросом геолокации."""
     if HTTPServer is None or BaseHTTPRequestHandler is None or parse_qs is None or urlparse is None:
         return
 
@@ -312,13 +119,23 @@ def _run_http_gps_server(port: int, on_position: Callable[[float, float], None])
         if cert_dir is None:
             use_https = False
 
-    HTML_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>GPS</title></head><body><p>Отправка геолокации на ПК…</p><script>
+    HTML_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>GPS — Orbit</title></head><body><p id="msg">Запрос доступа к геолокации…</p><p id="coords"></p><script>
 (function(){
-  if (!navigator.geolocation) { document.body.innerHTML="<p>Геолокация недоступна.</p>"; return; }
-  navigator.geolocation.getCurrentPosition(function(pos){
-    var lat=pos.coords.latitude, lon=pos.coords.longitude;
-    window.location.href="/?lat="+lat+"&lon="+lon;
-  }, function(){ document.body.innerHTML="<p>Доступ к геолокации запрещён.</p>"; });
+  if (!navigator.geolocation) { document.getElementById("msg").textContent = "Геолокация недоступна."; return; }
+  function send(lat, lon) {
+    var x = new XMLHttpRequest();
+    x.open("GET", "/?lat=" + lat + "&lon=" + lon, true);
+    x.send();
+  }
+  function onPos(pos) {
+    var lat = pos.coords.latitude, lon = pos.coords.longitude;
+    document.getElementById("msg").textContent = "Координаты отправляются на ПК.";
+    document.getElementById("coords").textContent = lat.toFixed(5) + ", " + lon.toFixed(5);
+    send(lat, lon);
+  }
+  function onErr() { document.getElementById("msg").textContent = "Доступ к геолокации запрещён или ошибка."; }
+  navigator.geolocation.getCurrentPosition(onPos, onErr, { enableHighAccuracy: true });
+  navigator.geolocation.watchPosition(onPos, onErr, { enableHighAccuracy: true, maximumAge: 5000 });
 })();
 </script></body></html>"""
 
@@ -335,7 +152,7 @@ def _run_http_gps_server(port: int, on_position: Callable[[float, float], None])
                     lon_f = float(lon_s)
                     if -90 <= lat_f <= 90 and -180 <= lon_f <= 180:
                         on_position(lat_f, lon_f)
-                        logger.info("GPS HTTP: получены координаты %.5f, %.5f", lat_f, lon_f)
+                        logger.info("GPS: получены координаты %.5f, %.5f", lat_f, lon_f)
                         has_coords = True
             except (ValueError, TypeError, IndexError):
                 pass
@@ -364,7 +181,7 @@ def _run_http_gps_server(port: int, on_position: Callable[[float, float], None])
         else:
             scheme = "http"
         logger.info(
-            "GPS HTTP: приём координат на порту %s (%s). Откройте на телефоне: %s://IP_ПК:%s/",
+            "GPS: приём координат на порту %s (%s). Откройте на телефоне: %s://IP_ПК:%s/",
             port, scheme.upper(), scheme, port,
         )
         server.serve_forever()
@@ -372,65 +189,51 @@ def _run_http_gps_server(port: int, on_position: Callable[[float, float], None])
         logger.warning("GPS HTTP сервер: %s", e)
 
 
-class GpsAggregator:
-    """
-    Объединяет NMEA (TCP) и опционально HTTP: приоритет у NMEA при подключённом телефоне,
-    иначе — последние координаты по HTTP (если не старше 2 минут).
-    """
+class BrowserGps:
+    """Приём координат только через браузер (HTTP)."""
 
-    def __init__(self, network_gps: NetworkGps, http_port: int = 0):
-        self._nmea = network_gps
+    def __init__(self, http_port: int = 0, default_lat: float = None, default_lon: float = None):
         self._http_port = max(0, int(http_port))
-        self._http_lat: Optional[float] = None
-        self._http_lon: Optional[float] = None
-        self._http_time: float = 0.0
-        self._http_lock = threading.Lock()
+        self._default_lat = default_lat if default_lat is not None else DEFAULT_LAT
+        self._default_lon = default_lon if default_lon is not None else DEFAULT_LON
+        self._lat: Optional[float] = None
+        self._lon: Optional[float] = None
+        self._last_time: float = 0.0
+        self._lock = threading.Lock()
         if self._http_port > 0 and HTTPServer is not None:
             threading.Thread(
                 target=_run_http_gps_server,
-                args=(self._http_port, self._set_http_position),
+                args=(self._http_port, self._set_position),
                 daemon=True,
             ).start()
 
-    def _set_http_position(self, lat: float, lon: float) -> None:
-        with self._http_lock:
-            self._http_lat = lat
-            self._http_lon = lon
-            self._http_time = time.time()
+    def _set_position(self, lat: float, lon: float) -> None:
+        with self._lock:
+            self._lat = lat
+            self._lon = lon
+            self._last_time = time.time()
 
     def get_position(self) -> GpsPosition:
-        if self._nmea.is_connected():
-            return self._nmea.get_position()
-        with self._http_lock:
-            if self._http_lat is not None and self._http_lon is not None and (time.time() - self._http_time) < 120.0:
-                return GpsPosition(latitude=self._http_lat, longitude=self._http_lon)
-        return self._nmea.get_position()
+        with self._lock:
+            if self._lat is not None and self._lon is not None and (time.time() - self._last_time) < 120.0:
+                return GpsPosition(latitude=self._lat, longitude=self._lon)
+            return GpsPosition(latitude=self._default_lat, longitude=self._default_lon)
 
     def is_connected(self) -> bool:
-        if self._nmea.is_connected():
-            return True
-        with self._http_lock:
-            return (self._http_lat is not None and (time.time() - self._http_time) < 120.0)
+        with self._lock:
+            return self._lat is not None and (time.time() - self._last_time) < 120.0
 
     def stop(self) -> None:
-        self._nmea.stop()
+        pass
 
 
-_default_gps: Optional[NetworkGps] = None
-_default_aggregator: Optional["GpsAggregator"] = None
+_default_gps: Optional[BrowserGps] = None
 
 
-def get_gps(
-    host: Optional[str] = None,
-    port: Optional[int] = None,
-):
-    """Возвращает единственный экземпляр GPS (NMEA TCP; при GPS_HTTP_PORT > 0 — с приёмом по HTTP)."""
-    global _default_gps, _default_aggregator
+def get_gps():
+    """Возвращает единственный экземпляр GPS (только через браузер)."""
+    global _default_gps
     if _default_gps is None:
-        _default_gps = NetworkGps(host=host, port=port)
-    if GPS_HTTP_PORT and _default_aggregator is None:
-        _default_aggregator = GpsAggregator(_default_gps, GPS_HTTP_PORT)
-        return _default_aggregator
-    if _default_aggregator is not None:
-        return _default_aggregator
+        port = int(GPS_HTTP_PORT) if GPS_HTTP_PORT else 0
+        _default_gps = BrowserGps(http_port=port)
     return _default_gps
