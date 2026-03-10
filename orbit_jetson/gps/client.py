@@ -163,7 +163,7 @@ def _run_http_gps_server(port: int, on_position: Callable[[float, float], None])
                     lon_f = float(lon_s)
                     if -90 <= lat_f <= 90 and -180 <= lon_f <= 180:
                         on_position(lat_f, lon_f)
-                        logger.info("GPS: получены координаты %.5f, %.5f", lat_f, lon_f)
+                        logger.info("GPS: широта %.5f, долгота %.5f", lat_f, lon_f)
                         has_coords = True
             except (ValueError, TypeError, IndexError):
                 pass
@@ -193,7 +193,10 @@ def _run_http_gps_server(port: int, on_position: Callable[[float, float], None])
             scheme = "http"
         local_ip = _get_local_ip() or "IP_ПК"
         url = "%s://%s:%s/" % (scheme, local_ip, port)
-        logger.info("GPS: приём на порту %s (%s). На телефоне откройте: %s", port, scheme.upper(), url)
+        logger.info(
+            "GPS: приём на порту %s (%s). Браузер: %s ; мост Firebase → http://127.0.0.1:%s/",
+            port, scheme.upper(), url, port,
+        )
         server.serve_forever()
     except Exception as e:
         logger.warning("GPS HTTP сервер: %s", e)
@@ -210,6 +213,7 @@ class BrowserGps:
         self._lon: Optional[float] = None
         self._last_time: float = 0.0
         self._lock = threading.Lock()
+        self._position_listeners: list = []  # вызов (lat, lon) при каждом обновлении координат
         if self._http_port > 0 and HTTPServer is not None:
             threading.Thread(
                 target=_run_http_gps_server,
@@ -217,11 +221,20 @@ class BrowserGps:
                 daemon=True,
             ).start()
 
+    def add_position_listener(self, callback: Callable[[float, float], None]) -> None:
+        """Подписка на обновление координат: callback(lat, lon) вызывается при каждом новом положении."""
+        self._position_listeners.append(callback)
+
     def _set_position(self, lat: float, lon: float) -> None:
         with self._lock:
             self._lat = lat
             self._lon = lon
             self._last_time = time.time()
+        for cb in self._position_listeners:
+            try:
+                cb(lat, lon)
+            except Exception:
+                pass
 
     def get_position(self) -> GpsPosition:
         with self._lock:

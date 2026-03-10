@@ -41,16 +41,14 @@ ALPR_COUNTRY_CODE = "KZ"
 ALPR_DEFAULT_LABEL = ""     # регион OCR: "kz", "ru", "eu" или пусто = из кода страны
 ALPR_UPSCALING = False      # True = лучше мелкие номера, у части ПК пропадает рамка
 ALPR_JPEG_QUALITY = 98      # качество кадра для распознавания (1–100)
-ALPR_INPUT_MIN_WIDTH = 1920 # масштабировать кадр до этой ширины перед OCR (2560 = лучше мелкие)
+ALPR_INPUT_MIN_WIDTH = 1280 # меньше = быстрее (1280 компромисс), 1920 = лучше мелкие номера
 ALPR_ALLOW_EU = False       # только КЗ/СНГ форматы
 ALPR_DETECT_EVERY_N_FRAMES = 1   # 1 = каждый кадр (макс. скорость), 2 = реже, но меньше нагрузка
+ALPR_LOOP_INTERVAL_SEC = 0.2  # пауза между циклами ALPR (сек); 0.2 = быстрее реакция, 0.5 = меньше нагрузка
 ALPR_PRE_SHARPEN = False    # лёгкая резкость перед OCR (при размытой камере)
 ALPR_CROP_UPSCALE_FOR_OCR = 2    # масштаб кропа перед OCR в фоне (1 = без масштаба)
 ALPR_CONFIRM_CYCLES = 1     # 1 = сразу после первого совпадения (быстрее), 2 = ждать 2 цикла
 ALPR_CONFIRM_SECONDS = 0.8  # сек ожидания перед отправкой (0.8 = быстрее, было 2.5)
-ALPR_MIN_BBOX_WIDTH = 40   # увеличить = не цеплять мелкий мусор (клавиатура и т.п.)
-ALPR_MIN_BBOX_HEIGHT = 14
-ALPR_MIN_BBOX_AREA = 400
 DRAW_OBJECT_BOXES = False  # False = только зелёные рамки номеров
 ALPR_HIGH_CONF_ADD_AT_ONCE = 0.82  # при такой уверенности — сразу в список без ожидания (быстрее)
 

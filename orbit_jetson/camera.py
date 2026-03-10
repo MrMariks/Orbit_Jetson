@@ -13,7 +13,6 @@ import tempfile
 import threading
 import time
 import warnings
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -31,9 +30,6 @@ from .config import (
     ALPR_DETECT_EVERY_N_FRAMES,
     ALPR_CONFIRM_CYCLES,
     ALPR_CONFIRM_SECONDS,
-    ALPR_MIN_BBOX_WIDTH,
-    ALPR_MIN_BBOX_HEIGHT,
-    ALPR_MIN_BBOX_AREA,
     ALPR_ALLOW_EU,
     ALPR_HIGH_CONF_ADD_AT_ONCE,
     DRAW_OBJECT_BOXES,
@@ -46,6 +42,7 @@ from .config import (
     ALPR_FULL_EVERY_N_CYCLES,
     ALPR_DETECT_THEN_OCR_ASYNC,
     ALPR_CROP_UPSCALE_FOR_OCR,
+    ALPR_LOOP_INTERVAL_SEC,
     DISPLAY_WIDTH,
     DISPLAY_HEIGHT,
     DISPLAY_JPEG_QUALITY,
@@ -58,7 +55,7 @@ IS_WINDOWS = sys.platform == "win32"
 CAP_MSMF = getattr(cv2, "CAP_MSMF", -1)
 # Скрыть предупреждения OpenCV «can't be used to capture by index» при переборе камер (всё равно пробуем следующий индекс)
 if getattr(cv2, "setLogLevel", None) is not None:
-    cv2.setLogLevel(3)  # 3 = LOG_LEVEL_ERROR, без WARNING
+    cv2.setLogLevel(2)  # 2 = только ERROR, без WARNING (убирает DSHOW/cap.cpp из лога)
 logger = logging.getLogger(__name__)
 
 # Форматы госномеров: 000AAA00 (цифры-буквы-цифры) или A000AAA (буква-цифры-буквы)
@@ -69,20 +66,22 @@ PLATE_FORMAT_4 = re.compile(r"^\d{3}[A-Za-zА-Яа-я]{2}\d{2}$")   # 778YA01, 9
 # Допускаем пробелы/дефисы между группами
 PLATE_CLEAN = re.compile(r"[\s\-]+")
 
-# Типичные «мусорные» подстроки: клавиатура, слова — не номер
-GARBAGE_SUBSTRINGS = frozenset([
-    "QWERTY", "ASDF", "ZXCV", "QWER", "TYUI", "ASDFGH", "ZXCVBN",
-    "TEST", "SAMPLE", "DEMO", "EXAMPLE", "HELLO", "WORLD", "KEY",
-    "KEYBOARD", "CLAVIER", "TASTATUR", "TECLADO",
-    "ЙЦУКЕН", "ФЫВА", "ПРОЛДЖ", "ЯЧСМИТ",
-])
-GARBAGE_CONSECUTIVE = re.compile(r"(.)\1\1|([AEIOUYАЕЁИОУЫЭЮЯaeiouyаеёиоуыэюя]{4,})")
-
-
 def normalize_plate(text: str) -> str:
     """Очистка: только буквы и цифры, верхний регистр."""
     t = PLATE_CLEAN.sub("", text).strip().upper()
     return t
+
+
+def _strip_plate_prefix(text: str) -> str:
+    """Убирает префикс страны в начале (KZ, RU и т.п.), чтобы «KZ 001GGG 09» → «001GGG09»."""
+    if not text or len(text) < 6:
+        return text.strip()
+    t = text.strip().upper()
+    if len(t) >= 2 and t[0].isalpha() and t[1].isalpha():
+        rest = t[2:].lstrip()
+        if len(rest) >= 5 and any(c.isdigit() for c in rest) and any(c.isalpha() for c in rest):
+            return rest
+    return text.strip()
 
 
 def _fix_plate_ocr(text: str) -> str:
@@ -114,44 +113,17 @@ def _fix_plate_ocr(text: str) -> str:
     return "".join(s)
 
 
-def _is_likely_garbage(text: str) -> bool:
-    """Отсекает мусор: повторы (клавиатура), мало разных символов, мало цифр/букв."""
-    if len(text) < 5:
-        return True
-    t_upper = text.upper()
-    for sub in GARBAGE_SUBSTRINGS:
-        if sub in t_upper:
-            return True
-    if GARBAGE_CONSECUTIVE.search(t_upper):
-        return True
-    c = Counter(text)
-    min_unique = 4 if len(text) >= 8 else 3
-    if len(c) < min_unique:
-        return True
-    if max(c.values()) >= 4:
-        return True
-    digits = sum(1 for x in text if x.isdigit())
-    letters = sum(1 for x in text if x.isalpha())
-    # Жёлтые номера КЗ: B1234 (1 буква + 4 цифры) или B123418
-    if PLATE_FORMAT_3.match(text):
-        return not (digits >= 4 and letters >= 1)
-    if digits < 2 or letters < 2:
-        return True
-    return False
-
-
 def looks_like_plate(text: str, allow_eu: bool = False) -> bool:
-    """Форматы КЗ/СНГ: 000AAA00, A000AAA, B1234/B123418, 927РК06 (2 буквы). При allow_eu=True — также EU."""
+    """Только форматы КЗ: 000AAA00, A000AAA, B1234/B123418, 927РК06."""
     t = normalize_plate(text)
-    if len(t) != 7 and len(t) != 8 and len(t) != 5 and not (allow_eu and 6 <= len(t) <= 10):
+    if len(t) not in (5, 7, 8):
         return False
-    if PLATE_FORMAT_1.match(t) or PLATE_FORMAT_2.match(t) or PLATE_FORMAT_3.match(t) or PLATE_FORMAT_4.match(t):
-        if not _is_likely_garbage(t):
-            return True
-    if allow_eu and 6 <= len(t) <= 10:
-        if not _is_likely_garbage(t) and re.search(r"\d", t) and re.search(r"[A-Za-zА-Яа-я]", t):
-            return True
-    return False
+    return bool(
+        PLATE_FORMAT_1.match(t)
+        or PLATE_FORMAT_2.match(t)
+        or PLATE_FORMAT_3.match(t)
+        or PLATE_FORMAT_4.match(t)
+    )
 
 
 def _frame_is_useful(frame) -> bool:
@@ -281,6 +253,7 @@ def preload_alpr() -> None:
         logger.debug("ALPR готов")
 
 
+
 def warmup_camera() -> None:
     """
     Коротко открыть и закрыть камеру по индексам 0,1,2 — «прогрев» драйвера.
@@ -330,10 +303,8 @@ class CameraWorker:
         self._pending_plates: Dict[str, Tuple[int, float]] = {}  # key -> (frame_count, first_time)
         self._confirm_seconds = ALPR_CONFIRM_SECONDS
         self._confirm_min_frames = ALPR_CONFIRM_CYCLES * ALPR_DETECT_EVERY_N_FRAMES
-        self._min_bbox_w = ALPR_MIN_BBOX_WIDTH
-        self._min_bbox_h = ALPR_MIN_BBOX_HEIGHT
-        self._min_bbox_area = ALPR_MIN_BBOX_AREA
-        self._allow_eu = ALPR_ALLOW_EU
+        # Только казахстанские форматы номеров.
+        self._allow_eu = False
         self._last_raw_frame: Optional["np.ndarray"] = None
         self._last_raw_frame_lock = threading.Lock()
         self._last_draw_bboxes: List[Tuple[int, int, int, int]] = []
@@ -354,6 +325,23 @@ class CameraWorker:
         self._ocr_queue: "queue.Queue" = queue.Queue(maxsize=10)  # (crop_np, full_np, lat, lon) для фонового OCR
         self._ocr_thread: Optional[threading.Thread] = None
         self._ocr_stop = False
+        self._detection_only = False  # True = только рамки, без OCR и отправки (переключается из UI)
+        self._video_path: Optional[str] = None  # если задан — источник видео из файла вместо камеры
+
+    def set_video_path(self, path: Optional[str]) -> None:
+        """Источник: видеофайл (путь) или None = камера. Применяется при следующем Старт."""
+        self._video_path = (str(path).strip() or None) if path else None
+
+    def get_video_path(self) -> Optional[str]:
+        return self._video_path
+
+    def set_detection_only(self, value: bool) -> None:
+        """Режим «только детекция»: рамки без OCR и отправки на сервер."""
+        self._detection_only = bool(value)
+
+    def set_confidence_min(self, value: float) -> None:
+        """Порог уверенности модели (0.0–1.0), в реальном времени."""
+        self._conf_min = max(0.0, min(1.0, float(value)))
 
     def set_gps(self, lat: Optional[float], lon: Optional[float]) -> None:
         self._last_lat, self._last_lon = lat, lon
@@ -510,8 +498,30 @@ class CameraWorker:
             return True
         # Загрузка ALPR при старте мониторинга (ошибки — сразу в лог, не при первом кадре)
         _get_alpr_pipeline()
-        if not SEND_DETECTION_ONLY:
+        if not SEND_DETECTION_ONLY or getattr(self, "_detection_only", False):
             _get_detect_only_pipeline()
+        # Источник — видеофайл (работает как камера, в конце — зацикливание)
+        if self._video_path:
+            p = Path(self._video_path)
+            if p.is_file():
+                self._cap = cv2.VideoCapture(str(p))
+                if self._cap and self._cap.isOpened():
+                    self._used_camera_index = None
+                    self._running = True
+                    self._last_detected.clear()
+                    self._pending_plates.clear()
+                    self._pending_unrecognized.clear()
+                    self._last_dedup_time = time.time()
+                    self._first_frame_logged = False
+                    self._start_alpr_thread()
+                    logger.info("Источник: видеофайл %s", p.name)
+                    return True
+                if self._cap:
+                    self._cap.release()
+                    self._cap = None
+                logger.warning("Не удалось открыть видео: %s", self._video_path)
+            else:
+                logger.warning("Файл не найден: %s", self._video_path)
         if ALPR_DETECT_THEN_OCR_ASYNC and not SEND_DETECTION_ONLY:
             self._ocr_stop = False
             self._ocr_thread = threading.Thread(target=self._ocr_worker_loop, daemon=True)
@@ -564,9 +574,10 @@ class CameraWorker:
             return
         self._alpr_stop = False
         def _alpr_loop() -> None:
+            interval = max(0.05, float(ALPR_LOOP_INTERVAL_SEC))
             while not self._alpr_stop and self._running:
                 self.run_alpr_on_latest_frame()
-                time.sleep(0.5)
+                time.sleep(interval)
         self._alpr_thread = threading.Thread(target=_alpr_loop, daemon=True)
         self._alpr_thread.start()
 
@@ -615,8 +626,8 @@ class CameraWorker:
             alpr_frame = frame
             scale_to_orig_x = 1.0
             scale_to_orig_y = 1.0
-            min_w = max(0, int(ALPR_INPUT_MIN_WIDTH))
-            if min_w > 0 and w_orig < min_w:
+            min_w = max(320, int(ALPR_INPUT_MIN_WIDTH))
+            if min_w > 0 and w_orig != min_w:
                 scale = min_w / float(w_orig)
                 w_alpr = min_w
                 h_alpr = int(round(h_orig * scale))
@@ -631,6 +642,43 @@ class CameraWorker:
                 cv2.imwrite(f.name, alpr_frame, [cv2.IMWRITE_JPEG_QUALITY, q])
                 path = f.name
             try:
+                # Режим «только детекция» из UI: только рамки, без OCR и отправки
+                if self._detection_only:
+                    detect_only_fn = _get_detect_only_pipeline()
+                    if detect_only_fn is not None:
+                        result_det = detect_only_fn([path])
+                        if result_det and len(result_det) > 0:
+                            out = result_det[0]
+                            if isinstance(out, (list, tuple)) and len(out) >= 1:
+                                detections = out[0] if isinstance(out[0], list) else []
+                                draw_bboxes_d: List[Tuple[int, int, int, int]] = []
+                                draw_plate_points_d: List[List[Tuple[int, int]]] = []
+                                for det in detections:
+                                    if not hasattr(det, "__len__") or len(det) < 7:
+                                        continue
+                                    x1, y1, x2, y2 = int(float(det[0])), int(float(det[1])), int(float(det[2])), int(float(det[3]))
+                                    pts = det[6]
+                                    if pts is not None and len(pts) >= 4:
+                                        points_xy = [(int(float(pts[j][0])), int(float(pts[j][1]))) for j in range(min(4, len(pts)))]
+                                        if len(points_xy) == 4:
+                                            xs, ys = [p[0] for p in points_xy], [p[1] for p in points_xy]
+                                            w, h = max(xs) - min(xs), max(ys) - min(ys)
+                                            if h <= 0 or w <= 0:
+                                                continue
+                                            points_xy_orig = [(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in points_xy] if (scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0) else points_xy
+                                            draw_bboxes_d.append((x1, y1, x2, y2))
+                                            draw_plate_points_d.append(points_xy)
+                                if scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0:
+                                    draw_bboxes_d = [(int(x1 * scale_to_orig_x), int(y1 * scale_to_orig_y), int(x2 * scale_to_orig_x), int(y2 * scale_to_orig_y)) for (x1, y1, x2, y2) in draw_bboxes_d]
+                                    draw_plate_points_d = [[(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in pts] for pts in draw_plate_points_d]
+                                with self._last_draw_lock:
+                                    self._last_draw_bboxes = draw_bboxes_d
+                                    self._last_draw_plate_points = draw_plate_points_d
+                    try:
+                        Path(path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return
                 # При ALPR_DETECT_THEN_OCR_ASYNC=False всегда полный пайплайн (нашли рамку и сразу распознали). При True — только детекция, OCR в фоне.
                 run_full = SEND_DETECTION_ONLY or not ALPR_DETECT_THEN_OCR_ASYNC or (self._alpr_cycle_count % ALPR_FULL_EVERY_N_CYCLES == 1)
                 if not run_full:
@@ -658,7 +706,7 @@ class CameraWorker:
                                             points_xy_orig = [(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in points_xy] if (scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0) else points_xy
                                             draw_bboxes_d.append((x1, y1, x2, y2))
                                             draw_plate_points_d.append(points_xy)
-                                            if ALPR_DETECT_THEN_OCR_ASYNC and conf_d >= self._conf_min and h > 0 and w > 0 and ALPR_ASPECT_RATIO_MIN <= w / h <= ALPR_ASPECT_RATIO_MAX and w >= self._min_bbox_w and h >= self._min_bbox_h and (w * h) >= self._min_bbox_area:
+                                            if ALPR_DETECT_THEN_OCR_ASYNC and h > 0 and w > 0:
                                                 cx, cy = (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2
                                                 if self._dedup_and_emit_region(cx, cy):
                                                     crop_img = self._crop_plate_region(frame, points_xy_orig)
@@ -688,9 +736,13 @@ class CameraWorker:
                     images_bboxs, images_points, region_names, confidences, texts = (
                         unpacked[1], unpacked[2], unpacked[5], unpacked[7], unpacked[8]
                     )
+                    # zones — перспективно выровненные кропы номеров (RectDetector внутри пайплайна)
+                    zones_raw = unpacked[3] if len(unpacked) > 3 else []
+                    zones_list = list(zones_raw[0]) if zones_raw and len(zones_raw) > 0 else []
                 else:
                     images_bboxs, images_points, texts = [], ([], []), []
                     confidences, region_names = [], []
+                    zones_list = []
                 points_list = (images_points[0] if images_points and len(images_points) > 0 else [])
                 texts_list = list(texts[0]) if texts and len(texts) > 0 else []
                 conf_list = list(confidences[0]) if confidences and len(confidences) > 0 else []
@@ -737,7 +789,7 @@ class CameraWorker:
                 if self._alpr_cycle_count == 1:
                     logger.info("ALPR: первый кадр обработан, в кадре детекций: %s", num_raw)
                 if num_raw == 0 and self._alpr_cycle_count % 10 == 1:
-                    logger.info("ALPR: модель работает, в кадре номер не найден (цикл %s). Наведите на номер или снизьте ALPR_CONFIDENCE_MIN в config.py до 0.70", self._alpr_cycle_count)
+                    logger.info("ALPR: модель работает, в кадре номер не найден (цикл %s)", self._alpr_cycle_count)
                 for i, pts in enumerate(points_list):
                     if pts is None or len(pts) < 4:
                         continue
@@ -746,14 +798,6 @@ class CameraWorker:
                     raw_text = texts_list[i] if i < len(texts_list) else ""
                     text = "".join(str(x) for x in raw_text) if isinstance(raw_text, (list, tuple)) else str(raw_text)
                     text = normalize_plate(text.strip())
-                    if conf < self._conf_min:
-                        self._alpr_dropped_conf_count += 1
-                        if self._alpr_dropped_conf_count % 10 == 1:
-                            logger.info(
-                                "ALPR: номер отброшен по уверенности (%.2f < %.2f): «%s». Снизьте ALPR_CONFIDENCE_MIN в config.py до 0.70–0.75",
-                                conf, self._conf_min, text or "(пусто)",
-                            )
-                        continue
                     points_xy = [(int(pts[j][0]), int(pts[j][1])) for j in range(min(4, len(pts)))]
                     if scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0:
                         points_xy_orig = [(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in points_xy]
@@ -763,56 +807,85 @@ class CameraWorker:
                     w, h = max(xs) - min(xs), max(ys) - min(ys)
                     if h <= 0 or w <= 0:
                         continue
-                    if w / h < ALPR_ASPECT_RATIO_MIN or w / h > ALPR_ASPECT_RATIO_MAX:
-                        continue
-                    if w < self._min_bbox_w or h < self._min_bbox_h or (w * h) < self._min_bbox_area:
-                        continue
                     passed += 1
-                    # Совмещённый режим: пробуем распознать; если текст есть — шлём текст+фото, иначе — только фото
+                    # Совмещённый режим: пробуем распознать; если текст есть — шлём текст+фото, иначе — только фото.
+                    # Важно: JPEG кодируем лениво только когда действительно нужно отправлять событие,
+                    # иначе на каждом кандидате появляется лаг.
                     cx, cy = (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2
-                    zoomed_img = self._crop_zoomed_region(frame, points_xy_orig, expand_factor=2.0)
-                    zoomed_image_bytes = (cv2.imencode(".jpg", zoomed_img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes() if zoomed_img is not None else cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
-                    crop_img = self._crop_plate_region(frame, points_xy_orig)
-                    crop_image_bytes = cv2.imencode(".jpg", crop_img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes() if crop_img is not None else zoomed_image_bytes
-                    # Квадратные номера: OCR долго думает — сразу шлём фото на сервер, без ожидания распознавания
-                    if w / h <= ALPR_SQUARE_MAX:
-                        if self._dedup_and_emit_region(cx, cy) and self.on_plate_detected:
-                            self.on_plate_detected("не удалось распознать", self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
-                        continue
-                    if not text or not looks_like_plate(text, self._allow_eu):
-                        text = _fix_plate_ocr(text) if text else ""
-                    if not text or not looks_like_plate(text, self._allow_eu):
-                        # Не шлём «не удалось распознать» сразу — даём OCR время (те же confirm_seconds/cycles)
+                    payload_cache = None
+                    _plate_idx = i
+                    _zones_snap = zones_list
+
+                    def _get_payload_bytes(
+                        _idx=_plate_idx, _zl=_zones_snap, _pts=points_xy_orig, _frm=frame
+                    ):
+                        nonlocal payload_cache
+                        if payload_cache is None:
+                            # full_image — зум на номер с отступом (контекст)
+                            zoomed_img = self._crop_zoomed_region(_frm, _pts, expand_factor=2.0)
+                            zoomed_image_bytes = (
+                                cv2.imencode(".jpg", zoomed_img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes()
+                                if zoomed_img is not None
+                                else cv2.imencode(".jpg", _frm, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
+                            )
+                            # crop_image — перспективно выровненный кроп (zone из RectDetector)
+                            zone_img = _zl[_idx] if _idx < len(_zl) else None
+                            if zone_img is not None and isinstance(zone_img, np.ndarray) and zone_img.size > 0:
+                                crop_image_bytes = cv2.imencode(
+                                    ".jpg", zone_img, [cv2.IMWRITE_JPEG_QUALITY, 95]
+                                )[1].tobytes()
+                            else:
+                                # Fallback: простой bbox-кроп
+                                crop_img = self._crop_plate_region(_frm, _pts)
+                                crop_image_bytes = (
+                                    cv2.imencode(".jpg", crop_img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+                                    if crop_img is not None
+                                    else zoomed_image_bytes
+                                )
+                            payload_cache = (zoomed_image_bytes, crop_image_bytes)
+                        return payload_cache
+                    # Исправление OCR (O→0, I→1) и проверка формата номера
+                    if text:
+                        text = _strip_plate_prefix(text)
+                        text = normalize_plate(text)
+                        text = _fix_plate_ocr(text)
+                    if text and looks_like_plate(text, self._allow_eu):
+                        # Есть валидный текст — всегда используем его, даже если рамка «квадратная»
+                        raw_region = regions_list[i] if i < len(regions_list) else self._country
+                        region = str(raw_region[0] if isinstance(raw_region, (list, tuple)) and raw_region else raw_region) if raw_region else self._country
+                        key = normalize_plate(text)
+                        high_conf = conf >= ALPR_HIGH_CONF_ADD_AT_ONCE
                         region_key = (cx // 80, cy // 80)
-                        if region_key not in self._pending_unrecognized:
-                            self._pending_unrecognized[region_key] = (self._alpr_cycle_count, now)
+                        self._pending_unrecognized.pop(region_key, None)
+                        if key not in self._pending_plates:
+                            if high_conf:
+                                if self._dedup_and_emit(text) and self.on_plate_detected:
+                                    zoomed_image_bytes, crop_image_bytes = _get_payload_bytes()
+                                    self.on_plate_detected(text, self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
+                            else:
+                                self._pending_plates[key] = (self._alpr_cycle_count, now)
                         else:
-                            first_cycle, first_time = self._pending_unrecognized[region_key]
-                            if now - first_time > self._confirm_seconds and (self._alpr_cycle_count - first_cycle >= ALPR_CONFIRM_CYCLES):
-                                if self._dedup_and_emit_region(cx, cy) and self.on_plate_detected:
-                                    self.on_plate_detected("не удалось распознать", self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
-                                del self._pending_unrecognized[region_key]
+                            first_cycle, first_time = self._pending_plates[key]
+                            if now - first_time > self._confirm_seconds:
+                                self._pending_plates[key] = (self._alpr_cycle_count, now)
+                            elif self._alpr_cycle_count - first_cycle >= ALPR_CONFIRM_CYCLES or high_conf:
+                                if self._dedup_and_emit(text) and self.on_plate_detected:
+                                    zoomed_image_bytes, crop_image_bytes = _get_payload_bytes()
+                                    self.on_plate_detected(text, self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
+                                del self._pending_plates[key]
                         continue
-                    raw_region = regions_list[i] if i < len(regions_list) else self._country
-                    region = str(raw_region[0] if isinstance(raw_region, (list, tuple)) and raw_region else raw_region) if raw_region else self._country
-                    key = normalize_plate(text)
-                    high_conf = conf >= ALPR_HIGH_CONF_ADD_AT_ONCE
+                    # Нет валидного текста: не шлём «не удалось распознать» сразу — даём OCR время (confirm_seconds/cycles)
                     region_key = (cx // 80, cy // 80)
-                    self._pending_unrecognized.pop(region_key, None)  # раз распознали — не слать «не удалось распознать»
-                    if key not in self._pending_plates:
-                        if high_conf:
-                            if self._dedup_and_emit(text) and self.on_plate_detected:
-                                self.on_plate_detected(text, self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
-                        else:
-                            self._pending_plates[key] = (self._alpr_cycle_count, now)
+                    if region_key not in self._pending_unrecognized:
+                        self._pending_unrecognized[region_key] = (self._alpr_cycle_count, now)
                     else:
-                        first_cycle, first_time = self._pending_plates[key]
-                        if now - first_time > self._confirm_seconds:
-                            self._pending_plates[key] = (self._alpr_cycle_count, now)
-                        elif self._alpr_cycle_count - first_cycle >= ALPR_CONFIRM_CYCLES or high_conf:
-                            if self._dedup_and_emit(text) and self.on_plate_detected:
-                                self.on_plate_detected(text, self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
-                            del self._pending_plates[key]
+                        first_cycle, first_time = self._pending_unrecognized[region_key]
+                        if now - first_time > self._confirm_seconds and (self._alpr_cycle_count - first_cycle >= ALPR_CONFIRM_CYCLES):
+                            if self._dedup_and_emit_region(cx, cy) and self.on_plate_detected:
+                                zoomed_image_bytes, crop_image_bytes = _get_payload_bytes()
+                                self.on_plate_detected("не удалось распознать", self._last_lat, self._last_lon, zoomed_image_bytes, crop_image_bytes)
+                            del self._pending_unrecognized[region_key]
+                    continue
                 for k in list(self._pending_plates):
                     if now - self._pending_plates[k][1] > self._confirm_seconds + 1:
                         del self._pending_plates[k]
@@ -895,12 +968,26 @@ class CameraWorker:
                     texts = unpacked[8]
                     raw_text = texts[0][0] if texts and len(texts[0]) > 0 else ""
                     text = "".join(str(x) for x in raw_text) if isinstance(raw_text, (list, tuple)) else str(raw_text)
+                    text = _strip_plate_prefix(text)
                     text = normalize_plate(text.strip())
                     if not looks_like_plate(text, self._allow_eu):
                         text = _fix_plate_ocr(text)
                     if looks_like_plate(text, self._allow_eu) and self.on_plate_detected and self._dedup_and_emit(text):
                         full_bytes = cv2.imencode(".jpg", full_np, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
-                        crop_bytes = cv2.imencode(".jpg", crop_np, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+                        # Используем zone (выровненный кроп) если пайплайн вернул zones
+                        zones_ocr = unpacked[3] if len(unpacked) > 3 else []
+                        zone_ocr = None
+                        try:
+                            if zones_ocr and len(zones_ocr) > 0 and len(zones_ocr[0]) > 0:
+                                z = zones_ocr[0][0]
+                                if isinstance(z, np.ndarray) and z.size > 0:
+                                    zone_ocr = z
+                        except Exception:
+                            zone_ocr = None
+                        if zone_ocr is not None:
+                            crop_bytes = cv2.imencode(".jpg", zone_ocr, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+                        else:
+                            crop_bytes = cv2.imencode(".jpg", crop_np, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
                         self.on_plate_detected(text, lat, lon, full_bytes, crop_bytes)
                         logger.info("Распознан номер: %s — отправка фото и номера на сервер", text)
                     elif text:
@@ -973,10 +1060,14 @@ class CameraWorker:
     def read_frame(self) -> Tuple[bool, Optional[bytes]]:
         """
         Читает кадр и сразу отдаёт для показа — без блокировки на ALPR (распознавание в отдельном потоке).
+        Для видеофайла: в конце файла — перемотка в начало (зацикливание).
         """
         if not self._running or not self._cap:
             return False, None
         ret, frame = self._cap.read()
+        if not ret and self._video_path:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self._cap.read()
         if not ret or frame is None:
             return False, None
         with self._last_raw_frame_lock:
@@ -1015,6 +1106,9 @@ class CameraWorker:
         if not self._running or not self._cap:
             return False, None
         ret, frame = self._cap.read()
+        if not ret and self._video_path:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self._cap.read()
         if not ret or frame is None:
             return False, None
         return True, frame

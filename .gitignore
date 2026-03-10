@@ -1,4 +1,5 @@
 orbit_jetson/api_key.txt
+orbit_jetson/gps/.firebase_secret
 orbit_jetson/gps/certs/
 recordings/
 venv/

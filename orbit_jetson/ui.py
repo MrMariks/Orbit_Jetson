@@ -16,6 +16,9 @@ from PyQt5.QtCore import QByteArray, QThread, pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QLabel,
@@ -30,7 +33,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .config import MAX_DISPLAYED_PLATES, DETECTION_DEDUP_HOURS, CROP_DEDUP_MINUTES, TELEMETRY_INTERVAL_SEC, POSITION_INTERVAL_SEC
+from .config import MAX_DISPLAYED_PLATES, DETECTION_DEDUP_HOURS, CROP_DEDUP_MINUTES, TELEMETRY_INTERVAL_SEC, ALPR_CONFIDENCE_MIN
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +244,7 @@ def _make_loading_page() -> QWidget:
     return page
 
 
+
 class CameraThread(QThread):
     """Поток захвата камеры: открывает камеру в этом же потоке и читает кадры (важно для Iriun)."""
 
@@ -296,6 +300,7 @@ class MainWindow(QMainWindow):
         self._latest_frame_bytes: Optional[bytes] = None  # последний кадр для плавного вывода
         self._map_view = None  # QWebEngineView or QLabel
         self._sent_plates: dict = {}  # нормализованный номер -> время последней отправки на сервер
+        self._last_sent_position: Optional[tuple] = None  # последнее отправленное положение (lat, lon)
         self.setWindowTitle("Orbit_Jetson — Патрульный модуль")
         self.setStyleSheet(STYLESHEET)
         self._stack: Optional[QStackedWidget] = None
@@ -345,6 +350,59 @@ class MainWindow(QMainWindow):
         right.setMaximumWidth(340)
         right_layout = QVBoxLayout(right)
         right_layout.setSpacing(14)
+
+        # Источник: камера или видеофайл
+        card_source = QFrame()
+        card_source.setObjectName("card")
+        source_inner = QVBoxLayout(card_source)
+        source_inner.setSpacing(8)
+        lbl_src = QLabel("Источник")
+        lbl_src.setObjectName("sectionLabel")
+        source_inner.addWidget(lbl_src)
+        self._source_label = QLabel("Камера")
+        self._source_label.setStyleSheet("color: #8b949e; font-size: 12px;")
+        self._source_label.setWordWrap(True)
+        source_inner.addWidget(self._source_label)
+        btn_load_video = QPushButton("Загрузить видео")
+        btn_load_video.setStyleSheet("background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 8px;")
+        btn_load_video.setCursor(Qt.PointingHandCursor)
+        btn_load_video.clicked.connect(self._on_load_video)
+        source_inner.addWidget(btn_load_video)
+        btn_clear_video = QPushButton("Сброс (камера)")
+        btn_clear_video.setStyleSheet("background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 6px; padding: 6px; font-size: 11px;")
+        btn_clear_video.setCursor(Qt.PointingHandCursor)
+        btn_clear_video.clicked.connect(self._on_clear_video)
+        source_inner.addWidget(btn_clear_video)
+        right_layout.addWidget(card_source)
+
+        self._update_source_label()
+
+        # Режим: Детекция+OCR / Только детекция и уверенность модели
+        card_mode = QFrame()
+        card_mode.setObjectName("card")
+        mode_inner = QVBoxLayout(card_mode)
+        mode_inner.setSpacing(8)
+        lbl_mode = QLabel("Режим распознавания")
+        lbl_mode.setObjectName("sectionLabel")
+        mode_inner.addWidget(lbl_mode)
+        self._combo_mode = QComboBox()
+        self._combo_mode.addItems(["Детекция + OCR", "Только детекция"])
+        self._combo_mode.setCurrentIndex(0)
+        self._combo_mode.setStyleSheet("background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 8px; color: #e6edf3; min-height: 20px;")
+        self._combo_mode.currentIndexChanged.connect(self._on_mode_changed)
+        mode_inner.addWidget(self._combo_mode)
+        lbl_conf = QLabel("Уверенность модели (0–1)")
+        lbl_conf.setStyleSheet("color: #8b949e; font-size: 11px;")
+        mode_inner.addWidget(lbl_conf)
+        self._spin_confidence = QDoubleSpinBox()
+        self._spin_confidence.setRange(0.50, 1.0)
+        self._spin_confidence.setSingleStep(0.01)
+        self._spin_confidence.setDecimals(2)
+        self._spin_confidence.setValue(float(ALPR_CONFIDENCE_MIN))
+        self._spin_confidence.setStyleSheet("background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 8px; color: #e6edf3; min-height: 20px;")
+        self._spin_confidence.valueChanged.connect(self._on_confidence_changed)
+        mode_inner.addWidget(self._spin_confidence)
+        right_layout.addWidget(card_mode)
 
         # Блок «Распознанные номера»
         card_plates = QFrame()
@@ -425,8 +483,6 @@ class MainWindow(QMainWindow):
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_status_bar)
         self._status_timer.start(2000)
-        self._position_timer = QTimer(self)
-        self._position_timer.timeout.connect(self._send_position)
         self._telemetry_timer = QTimer(self)
         self._telemetry_timer.timeout.connect(self._send_telemetry)
 
@@ -434,6 +490,19 @@ class MainWindow(QMainWindow):
         self._update_status_bar()
 
         self._update_map()
+
+        # Карта обновляется при каждом новом положении GPS (мост/браузер), а не по таймеру
+        if hasattr(self._gps, "add_position_listener"):
+
+            def _on_gps_position_changed(lat: float, lon: float) -> None:
+                # При каждом новом GPS сразу обновляем карту и отправляем позицию на сервер.
+                def _apply_change(la=lat, lo=lon):
+                    self._update_map(lat=la, lon=lo)
+                    self._send_position(lat=la, lon=lo, only_if_changed=True)
+
+                QTimer.singleShot(0, _apply_change)
+
+            self._gps.add_position_listener(_on_gps_position_changed)
 
         self._stack = QStackedWidget()
         self._stack.addWidget(loading_page)
@@ -447,6 +516,36 @@ class MainWindow(QMainWindow):
         self._btn_record.setEnabled(False)
         self._video_label.setText("Ошибка: не удалось открыть камеру.\nЗакройте окно Iriun Webcam на ПК и нажмите «Старт» снова.")
         self._update_status_bar()
+
+    def _on_mode_changed(self, index: int):
+        self._camera.set_detection_only(index == 1)
+
+    def _on_confidence_changed(self, value: float):
+        self._camera.set_confidence_min(value)
+
+    def _update_source_label(self):
+        path = self._camera.get_video_path()
+        if path:
+            import os
+            self._source_label.setText("Видео: " + os.path.basename(path))
+        else:
+            self._source_label.setText("Камера (индекс %s)" % getattr(self._camera, "camera_index", 0))
+
+    def _on_load_video(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите видеофайл",
+            "",
+            "Видео (*.mp4 *.avi *.mov *.mkv *.webm);;Все файлы (*)",
+        )
+        if path:
+            self._camera.set_video_path(path)
+            self._update_source_label()
+            logger.info("Источник: видеофайл %s", path)
+
+    def _on_clear_video(self):
+        self._camera.set_video_path(None)
+        self._update_source_label()
 
     def _update_status_bar(self):
         running = self._camera.is_running()
@@ -504,12 +603,12 @@ class MainWindow(QMainWindow):
         self._btn_stop.setEnabled(True)
         self._btn_record.setEnabled(True)
         self._btn_record.setText("●  Запись")
+        self._last_sent_position = None
         self._update_status_bar()
         # Вывод видео: обновление каждые 25 ms (~40 fps), меньше лагов
         self._display_timer = QTimer(self)
         self._display_timer.timeout.connect(self._paint_latest_frame)
         self._display_timer.start(25)
-        self._position_timer.start(int(POSITION_INTERVAL_SEC * 1000))
         self._telemetry_timer.start(int(TELEMETRY_INTERVAL_SEC * 1000))
         # Проверка доступности сервера в фоне — тогда в статус-баре сразу «Сервер ✓»
         threading.Thread(target=self._api.check_server, daemon=True).start()
@@ -520,7 +619,6 @@ class MainWindow(QMainWindow):
         if self._display_timer:
             self._display_timer.stop()
             self._display_timer = None
-        self._position_timer.stop()
         self._telemetry_timer.stop()
         self._latest_frame_bytes = None
         self._camera.stop_recording()
@@ -590,9 +688,11 @@ class MainWindow(QMainWindow):
         else:
             self._sent_plates[key] = now
             logger.info("[Сервер] Обнаружен номер %s — отправляю на сервер", display_text)
-            ok = self._api.send_detection(plate, full_image, crop_image)
-            if not ok:
-                logger.warning("[Сервер] Отправка не удалась для номера %s (см. сообщения выше)", display_text)
+            threading.Thread(
+                target=self._send_detection_background,
+                args=(plate, full_image, crop_image, display_text),
+                daemon=True,
+            ).start()
             plate_dedup_sec = DETECTION_DEDUP_HOURS * 3600
             crop_dedup_sec = CROP_DEDUP_MINUTES * 60
             for k in list(self._sent_plates):
@@ -602,23 +702,34 @@ class MainWindow(QMainWindow):
         pos = self._gps.get_position()
         self._camera.set_gps(pos.latitude, pos.longitude)
 
+    def _send_detection_background(self, plate: str, full_image: bytes, crop_image: bytes, display_text: str) -> None:
+        """Отправка детекции на сервер в фоне, чтобы не блокировать интерфейс."""
+        ok = self._api.send_detection(plate, full_image, crop_image)
+        if not ok:
+            logger.warning("[Сервер] Отправка не удалась для номера %s (см. сообщения выше)", display_text)
+
     def _send_telemetry(self):
         pos = self._gps.get_position()
         self._api.send_telemetry(pos)
         self._camera.set_gps(pos.latitude, pos.longitude)
-        self._update_map(lat=pos.latitude, lon=pos.longitude)
 
-    def _send_position(self):
-        """Отправка координат патруля на POST /api/v1/patrol/position для иконки на карте."""
-        pos = self._gps.get_position()
-        lat, lon = pos.latitude, pos.longitude
+    def _send_position(self, lat: float = None, lon: float = None, only_if_changed: bool = False):
+        """Отправка координат патруля на POST /api/v1/patrol/position."""
         if lat is None or lon is None:
+            pos = self._gps.get_position()
+            lat, lon = pos.latitude, pos.longitude
+        if lat is None or lon is None:
+            return
+        if not self._camera.is_running():
             return
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             return
+        point = (round(float(lat), 7), round(float(lon), 7))
+        if only_if_changed and self._last_sent_position == point:
+            return
         self._api.send_patrol_position(lat, lon)
+        self._last_sent_position = point
         self._camera.set_gps(lat, lon)
-        self._update_map(lat=lat, lon=lon)
 
     def _update_map(self, lat: float = None, lon: float = None):
         if not HAS_MAP or not folium:
