@@ -30,7 +30,7 @@ class OrbitApiClient:
         self.timeout = timeout
         self._session = requests.Session()
         self._session.headers.update({
-            "Authorization": f"Bearer {self.api_token}",
+            "X-API-Key": self.api_token,
             "Content-Type": "application/json",
         })
         self._logged_errors: set = set()  # (method, path, status_code) — не дублировать в консоль
@@ -43,17 +43,19 @@ class OrbitApiClient:
         Проверка доступности бэкенда. При старте мониторинга в статус-баре сразу «Сервер ✓»,
         не нужно ждать первой детекции.
         """
+        token_preview = (self.api_token[:8] + "…") if len(self.api_token) > 8 else (self.api_token or "(пусто)")
+        print(f"[API] Проверка сервера: {self.base_url}  токен={token_preview}")
         for path in ("/", "/docs", "/api/v1"):
             url = self.base_url + path
             try:
                 r = self._session.get(url, timeout=min(5, self.timeout))
                 # Любой ответ = сервер доступен (200, 404, 405 — главное что отвечает)
                 self._server_reachable = True
-                logger.debug("Сервер %s", self.base_url)
+                print(f"[API] Сервер доступен ({url} → HTTP {r.status_code})")
                 return True
-            except requests.RequestException:
+            except requests.RequestException as e:
                 continue
-        logger.debug("Сервер недоступен: %s", self.base_url)
+        print(f"[API] Сервер НЕДОСТУПЕН: {self.base_url}")
         return False
 
     def _request(self, method: str, path: str, json: Optional[Dict[str, Any]] = None) -> bool:
@@ -69,17 +71,19 @@ class OrbitApiClient:
             key = (method, path, r.status_code)
             if key not in self._logged_errors:
                 self._logged_errors.add(key)
-                logger.warning("API %s %s: %s %s", method, path, r.status_code, r.text[:200])
+                print(f"[API] ОШИБКА {method} {path}: HTTP {r.status_code} — {r.text[:300]}")
             return False
         except requests.RequestException as e:
-            logger.exception("API request failed: %s", e)
+            key = (method, path, type(e).__name__)
+            if key not in self._logged_errors:
+                self._logged_errors.add(key)
+                print(f"[API] НЕТ СВЯЗИ {method} {path}: {type(e).__name__}: {e}")
             return False
 
     def send_patrol_active(self) -> bool:
         """Патруль запустился: POST /api/v1/patrol/active (Authorization: Bearer)."""
         ok = self._request("POST", "/api/v1/patrol/active", json={})
-        if ok:
-            logger.info("Сервер: патруль отмечен как активный")
+        print("[API] patrol/active →", "OK ✓" if ok else "FAIL ✗")
         return ok
 
     def send_patrol_finish(self) -> bool:
@@ -109,8 +113,7 @@ class OrbitApiClient:
             "timestamp": position.timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         ok = self._request("POST", "/api/v1/patrol/telemetry", json=payload)
-        if ok:
-            logger.info("Сервер: телеметрия отправлена")
+        print("[API] patrol/telemetry →", "OK ✓" if ok else "FAIL ✗")
         return ok
 
     def send_detection(
@@ -139,13 +142,10 @@ class OrbitApiClient:
             if r.ok:
                 self._server_reachable = True
                 self._last_detection_ok = True
-                logger.info("[Сервер] Детекция отправлена успешно (HTTP %s): %s", r.status_code, plate_text.strip())
+                print(f"[API] detect → OK ✓  номер={plate_text.strip()!r}  HTTP {r.status_code}")
                 return True
-            logger.warning(
-                "[Сервер] Ошибка отправки детекции: HTTP %s, ответ: %s",
-                r.status_code, r.text,
-            )
+            print(f"[API] detect → FAIL ✗  номер={plate_text.strip()!r}  HTTP {r.status_code}: {r.text[:300]}")
             return False
         except requests.RequestException as e:
-            logger.exception("[Сервер] Исключение при отправке детекции: %s", e)
+            print(f"[API] detect → НЕТ СВЯЗИ: {type(e).__name__}: {e}")
             return False

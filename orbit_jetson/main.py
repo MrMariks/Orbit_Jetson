@@ -51,7 +51,7 @@ from .api_client import OrbitApiClient
 from .gps import get_gps
 from .gps.config import GPS_HTTP_PORT, GPS_HTTP_USE_HTTPS
 from .camera import CameraWorker, preload_alpr, warmup_camera
-from .ui import MainWindow
+from .ui import MainWindow, SplashWindow
 
 
 def main():
@@ -68,6 +68,12 @@ def main():
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(logging.Formatter("%(message)s"))
     status.addHandler(h)
+
+    # Диагностика рамок bbox: вывод в консоль при детекции/отрисовке (ALPR: запись _last_draw_bboxes, Отрисовка рамки bbox)
+    cam_log = logging.getLogger("orbit_jetson.camera")
+    cam_log.setLevel(logging.INFO)
+    cam_log.propagate = False
+    cam_log.addHandler(h)
 
     status.info("Старт программы")
 
@@ -98,49 +104,81 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Orbit_Jetson")
 
-    win = MainWindow(camera_worker=camera, api_client=api, gps_stub=gps)
-    win.showMaximized()
+    # --- Сплэш-экран (показывается пока грузятся модули) ---
+    splash = SplashWindow()
+    splash.show()
     app.processEvents()
 
     loading_done = [False]
 
     def load_task():
+        # 1. GPS
+        splash.update_loading_status("gps", "loading")
+        ok = bridge_process is not None
+        splash.update_loading_status("gps", "ok" if ok else "fail")
+
+        # 2. Сервер
+        splash.update_loading_status("server", "loading")
+        ok = api.check_server()
+        splash.update_loading_status("server", "ok" if ok else "fail")
+
+        # 3. Камера
+        splash.update_loading_status("camera", "loading")
+        warmup_camera()
+        splash.update_loading_status("camera", "ok")
+
+        # 4. ALPR (самый долгий — последний)
+        splash.update_loading_status("alpr", "loading")
         preload_alpr()
-        api.check_server()
-        warmup_camera()  # прогрев камеры — при первом «Старт мониторинга» не зависает
+        from .camera import _alpr_loaded
+        splash.update_loading_status("alpr", "ok" if _alpr_loaded else "fail")
+
         loading_done[0] = True
+
+    # MainWindow создаётся заранее, но скрытым — покажем после сплэша
+    win = MainWindow(camera_worker=camera, api_client=api, gps_stub=gps)
 
     def on_loading_check():
         if loading_done[0]:
-            win.show_main_content()
-            server_ok = getattr(api, "_server_reachable", False)
-            gps_ok = getattr(gps, "is_connected", lambda: False)()
-            # В лог — тот же формат, что и в статус-баре UI (ПО — | Модель — | Сервер ✓ | Камера — | GPS ✓)
-            s_server = "Сервер ✓" if server_ok else "Сервер —"
-            s_gps = "GPS ✓" if gps_ok else "GPS —"
-            status.info("ПО — | Модель — | %s | Камера — | %s", s_server, s_gps)
-            # Если GPS пока нет, но мост запущен — периодически проверять и вывести "GPS ✓" когда появятся данные
-            if bridge_process is not None and not gps_ok:
-                gps_ok_logged = [False]
+            splash.mark_done()
 
-                def check_gps_later():
-                    if gps_ok_logged[0]:
-                        return
-                    if getattr(gps, "is_connected", lambda: False)():
-                        status.info("GPS ✓")
-                        gps_ok_logged[0] = True
+            def _open_main():
+                # Передаём статусы из сплэша в главное окно (кружки ПО, Модель, Сервер, Камера, GPS)
+                win.set_splash_statuses(splash.get_statuses())
+                splash.close()
+                win.showMaximized()
+                server_ok = getattr(api, "_server_reachable", False)
+                gps_ok    = getattr(gps, "is_connected", lambda: False)()
+                from .camera import _alpr_loaded
+                s_model  = "Модель ✓" if _alpr_loaded else "Модель —"
+                s_server = "Сервер ✓" if server_ok else "Сервер —"
+                s_gps    = "GPS ✓" if gps_ok else "GPS —"
+                status.info("ПО ✓ | %s | %s | Камера — | %s", s_model, s_server, s_gps)
+                # Продолжать следить за GPS если ещё не появился
+                if bridge_process is not None and not gps_ok:
+                    gps_ok_logged = [False]
 
-                def schedule_check():
-                    check_gps_later()
-                    if not gps_ok_logged[0]:
-                        QTimer.singleShot(6000, schedule_check)
+                    def check_gps_later():
+                        if gps_ok_logged[0]:
+                            return
+                        if getattr(gps, "is_connected", lambda: False)():
+                            status.info("GPS ✓")
+                            gps_ok_logged[0] = True
 
-                QTimer.singleShot(6000, schedule_check)
+                    def schedule_check():
+                        check_gps_later()
+                        if not gps_ok_logged[0]:
+                            QTimer.singleShot(6000, schedule_check)
+
+                    QTimer.singleShot(6000, schedule_check)
+
+            # Небольшая пауза чтобы пользователь увидел все статусы "OK"
+            QTimer.singleShot(600, _open_main)
             return
-        QTimer.singleShot(350, on_loading_check)
+        QTimer.singleShot(300, on_loading_check)
 
     threading.Thread(target=load_task, daemon=True).start()
-    QTimer.singleShot(350, on_loading_check)
+    QTimer.singleShot(300, on_loading_check)
 
     if bridge_process is not None:
         def _stop_bridge():

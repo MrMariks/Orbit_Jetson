@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import warnings
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -33,6 +34,8 @@ from .config import (
     ALPR_ALLOW_EU,
     ALPR_HIGH_CONF_ADD_AT_ONCE,
     DRAW_OBJECT_BOXES,
+    PLATE_BOX_PADDING_PX,
+    PLATE_BOX_SMOOTH_FRAMES,
     SEND_DETECTION_ONLY,
     ALPR_DEFAULT_LABEL,
     ALPR_UPSCALING,
@@ -43,6 +46,7 @@ from .config import (
     ALPR_DETECT_THEN_OCR_ASYNC,
     ALPR_CROP_UPSCALE_FOR_OCR,
     ALPR_LOOP_INTERVAL_SEC,
+    ALPR_EVERY_NTH_CYCLE,
     DISPLAY_WIDTH,
     DISPLAY_HEIGHT,
     DISPLAY_JPEG_QUALITY,
@@ -193,57 +197,58 @@ def _get_alpr_pipeline():
                     _safe.append(_resnet.resnet18)
                 torch.serialization.add_safe_globals(_safe)
             from nomeroff_net import pipeline
-            from nomeroff_net.tools import unzip
-            # Регион/пресет для OCR (как в официальном репо: https://github.com/ria-com/nomeroff-net)
+            from nomeroff_net.tools import unzip  # noqa: F401 — проверяем доступность
             default_label = (ALPR_DEFAULT_LABEL or "").strip() or {
                 "KZ": "kz",
                 "RU": "ru",
                 "UA": "eu_ua_2015",
             }.get((ALPR_COUNTRY_CODE or "KZ").upper(), "eu_ua_2015")
-            _alpr_pipeline = pipeline(
-                "number_plate_detection_and_reading",
-                image_loader="opencv",
-                default_label=default_label,
-                upscaling=ALPR_UPSCALING,
-            )
+            # Пробуем с upscaling; если модуль upscaler не установлен или версия не поддерживает — без него
+            try:
+                _alpr_pipeline = pipeline(
+                    "number_plate_detection_and_reading",
+                    image_loader="opencv",
+                    default_label=default_label,
+                    upscaling=ALPR_UPSCALING,
+                )
+            except (TypeError, ModuleNotFoundError):
+                if ALPR_UPSCALING:
+                    print("[ALPR] upscaling недоступен (нет пакета 'upscaler' или версия не поддерживает) — загружаем без него")
+                _alpr_pipeline = pipeline(
+                    "number_plate_detection_and_reading",
+                    image_loader="opencv",
+                    default_label=default_label,
+                )
         global _alpr_loaded
         _alpr_loaded = True
-        logger.debug("ALPR включён (nomeroff-net)")
+        print("[ALPR] Модель загружена (nomeroff-net)")
         return _alpr_pipeline
     except OSError as e:
         if not _alpr_failed_logged:
             _alpr_failed_logged = True
-            if "1114" in str(e) or "c10.dll" in str(e).lower():
-                logger.warning(
-                    "nomeroff-net недоступен (ошибка загрузки PyTorch DLL): %s. "
-                    "Попробуйте: 1) импорт torch до Qt уже выполнен в main.py; "
-                    "2) установите Visual C++ Redistributable (x64); 3) переустановите PyTorch (CPU: pip install torch --force-reinstall). Видео без распознавания.",
-                    e,
-                )
-            else:
-                logger.warning("nomeroff-net недоступен, распознавание номеров отключено: %s", e)
+            msg = (
+                "nomeroff-net: ошибка загрузки PyTorch DLL — %s\n"
+                "Попробуйте: 1) pip install torch --force-reinstall  2) Visual C++ Redistributable (x64)" % e
+                if ("1114" in str(e) or "c10.dll" in str(e).lower())
+                else "nomeroff-net недоступен: %s" % e
+            )
+            print("[ALPR] ОШИБКА:", msg)
         return None
     except ModuleNotFoundError as e:
         if not _alpr_failed_logged:
             _alpr_failed_logged = True
             err = str(e)
             if "pkg_resources" in err:
-                logger.warning(
-                    "nomeroff-net недоступен: нет модуля pkg_resources. "
-                    "Установите setuptools: pip install \"setuptools>=65,<82\". Видео без распознавания."
-                )
+                print('[ALPR] ОШИБКА: нет pkg_resources — выполните: pip install "setuptools>=65,<82"')
             elif "turbojpeg" in err:
-                logger.warning(
-                    "nomeroff-net недоступен: нет модуля turbojpeg. "
-                    "Установите: pip install PyTurboJPEG. Видео без распознавания."
-                )
+                print("[ALPR] ОШИБКА: нет turbojpeg — выполните: pip install PyTurboJPEG")
             else:
-                logger.warning("nomeroff-net недоступен, распознавание номеров отключено: %s", e)
+                print("[ALPR] ОШИБКА: модуль не найден —", e)
         return None
     except Exception as e:
         if not _alpr_failed_logged:
             _alpr_failed_logged = True
-            logger.warning("nomeroff-net недоступен, распознавание номеров отключено: %s", e)
+            print("[ALPR] ОШИБКА при загрузке модели:", type(e).__name__, e)
         return None
 
 
@@ -251,7 +256,6 @@ def preload_alpr() -> None:
     """Предзагрузка модели при запуске приложения. По нажатию «Старт мониторинга» сканирование начнётся сразу."""
     if _get_alpr_pipeline() is not None:
         logger.debug("ALPR готов")
-
 
 
 def warmup_camera() -> None:
@@ -308,8 +312,13 @@ class CameraWorker:
         self._last_raw_frame: Optional["np.ndarray"] = None
         self._last_raw_frame_lock = threading.Lock()
         self._last_draw_bboxes: List[Tuple[int, int, int, int]] = []
+        self._last_draw_confidences: List[float] = []
         self._last_draw_plate_points: List[List[Tuple[int, int]]] = []
         self._last_draw_lock = threading.Lock()
+        self._last_draw_time = 0.0  # время последней записи bbox; таймаут 2 с для очистки
+        # Скользящее среднее координат bbox за последние N кадров (стабилизация рамки)
+        self._bbox_history: deque = deque(maxlen=PLATE_BOX_SMOOTH_FRAMES)
+        self._conf_history: deque = deque(maxlen=PLATE_BOX_SMOOTH_FRAMES)
         self._alpr_thread: Optional[threading.Thread] = None
         self._alpr_stop = False
         self._alpr_cycle_count = 0
@@ -334,6 +343,67 @@ class CameraWorker:
 
     def get_video_path(self) -> Optional[str]:
         return self._video_path
+
+    def recognize_image_file(self, image_path: str) -> List[Tuple[str, bytes, bytes]]:
+        """Запуск ALPR по одному изображению. Возвращает список (plate_text, full_image_bytes, crop_image_bytes).
+        Используется из debug_photo_loader (DEBUG ONLY)."""
+        from pathlib import Path
+        from .config import ALPR_JPEG_QUALITY
+        pipeline_fn = _get_alpr_pipeline()
+        if pipeline_fn is None:
+            return []
+        path = Path(image_path)
+        if not path.is_file():
+            return []
+        img = cv2.imread(str(path))
+        if img is None:
+            return []
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            q = max(1, min(100, int(ALPR_JPEG_QUALITY)))
+            cv2.imwrite(f.name, img, [cv2.IMWRITE_JPEG_QUALITY, q])
+            tmp_path = f.name
+        try:
+            from nomeroff_net.tools import unzip
+            result = pipeline_fn([tmp_path])
+            unpacked = unzip(result)
+            if len(unpacked) < 9:
+                return []
+            out = []
+            full_bytes = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+            texts = unpacked[8]  # per-image list of text results
+            zones = unpacked[3] if len(unpacked) > 3 else []
+            # one image -> texts[0] = list of strings (one per box)
+            text_list = texts[0] if texts and len(texts) > 0 else []
+            zone_list = (zones[0] if zones and len(zones) > 0 else [])
+            n = max(len(text_list), len(zone_list) if zone_list else 0)
+            if n == 0:
+                return []
+            for i in range(n):
+                raw_text = text_list[i] if i < len(text_list) else ""
+                text = "".join(str(x) for x in raw_text) if isinstance(raw_text, (list, tuple)) else str(raw_text or "")
+                text = _strip_plate_prefix(text)
+                text = normalize_plate(text.strip())
+                if not looks_like_plate(text, self._allow_eu):
+                    text = _fix_plate_ocr(text)
+                zone_img = None
+                try:
+                    if zone_list and i < len(zone_list):
+                        z = zone_list[i]
+                        if isinstance(z, np.ndarray) and z.size > 0:
+                            zone_img = z
+                except Exception:
+                    pass
+                if zone_img is not None:
+                    crop_bytes = cv2.imencode(".jpg", zone_img, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+                else:
+                    crop_bytes = full_bytes
+                out.append((text or "—", full_bytes, crop_bytes))
+            return out
+        finally:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def set_detection_only(self, value: bool) -> None:
         """Режим «только детекция»: рамки без OCR и отправки на сервер."""
@@ -431,7 +501,7 @@ class CameraWorker:
                             return True
                         if cap:
                             cap.release()
-            logger.error("Не удалось открыть камеру. Индекс=%s", self.camera_index)
+            print(f"[CAM] ОШИБКА: не удалось открыть камеру. Индекс={self.camera_index}")
             return False
         self._used_camera_index = self.camera_index
         logger.debug("Камера: открыта (индекс %s)", self._used_camera_index)
@@ -529,8 +599,10 @@ class CameraWorker:
         if IS_WINDOWS:
             # Сначала пробуем индекс из конфига (например 1 = Iriun/телефон), потом 0, 2 — чтобы на ноутбуке брать поток с телефона, а не встроенную вебку
             order = [self.camera_index] + [i for i in (0, 1, 2) if i != self.camera_index]
+            print(f"[CAM] Поиск камеры, порядок индексов: {order}")
             for idx in order:
                 prefer = idx == self.camera_index
+                print(f"[CAM] Пробую индекс {idx}{'  ← из конфига' if prefer else ''}…")
                 cap = self._open_and_get_useful_frame(idx, accept_any_frame=prefer)
                 if cap is not None:
                     self._cap = cap
@@ -542,9 +614,10 @@ class CameraWorker:
                     self._last_dedup_time = time.time()
                     self._first_frame_logged = False
                     self._start_alpr_thread()
-                    logger.info("Камера: используется индекс %s%s", idx, " (источник из конфига, например телефон)" if prefer else "")
+                    print(f"[CAM] Камера открыта на индексе {idx} ✓")
                     return True
-            logger.warning("Камера: по индексам 0, 1, 2 нет изображения. Открываю индекс %s.", self.camera_index)
+                print(f"[CAM] Индекс {idx} — нет кадра ✗")
+            print(f"[CAM] ОШИБКА: по индексам {order} нет изображения!")
         if not self._open_source():
             return False
         self._running = True
@@ -570,6 +643,7 @@ class CameraWorker:
         return True
 
     def _start_alpr_thread(self) -> None:
+        """Запускает поток ALPR (детекция и OCR в этом потоке)."""
         if self._alpr_thread is not None:
             return
         self._alpr_stop = False
@@ -600,8 +674,11 @@ class CameraWorker:
         self._run_alpr_on_frame(frame)
 
     def _run_alpr_on_frame(self, frame: "np.ndarray") -> None:
-        """Запуск ALPR в отдельном потоке — не блокирует показ картинки."""
+        """Запуск ALPR в потоке _alpr_thread. Прямые вызовы detect_only_fn() и pipeline_fn()."""
         self._alpr_cycle_count += 1
+        # Обрабатывать каждый N-й кадр — меньше фризов
+        if self._alpr_cycle_count % max(1, int(ALPR_EVERY_NTH_CYCLE)) != 0:
+            return
         now = time.time()
         pipeline_fn = _get_alpr_pipeline()
         if pipeline_fn is None:
@@ -647,16 +724,19 @@ class CameraWorker:
                     detect_only_fn = _get_detect_only_pipeline()
                     if detect_only_fn is not None:
                         result_det = detect_only_fn([path])
+                        time.sleep(0)  # отдать управление другим потокам
                         if result_det and len(result_det) > 0:
                             out = result_det[0]
                             if isinstance(out, (list, tuple)) and len(out) >= 1:
                                 detections = out[0] if isinstance(out[0], list) else []
                                 draw_bboxes_d: List[Tuple[int, int, int, int]] = []
                                 draw_plate_points_d: List[List[Tuple[int, int]]] = []
+                                draw_confs_d: List[float] = []
                                 for det in detections:
                                     if not hasattr(det, "__len__") or len(det) < 7:
                                         continue
                                     x1, y1, x2, y2 = int(float(det[0])), int(float(det[1])), int(float(det[2])), int(float(det[3]))
+                                    conf_d = float(det[4]) if len(det) > 4 else 0.5
                                     pts = det[6]
                                     if pts is not None and len(pts) >= 4:
                                         points_xy = [(int(float(pts[j][0])), int(float(pts[j][1]))) for j in range(min(4, len(pts)))]
@@ -665,33 +745,40 @@ class CameraWorker:
                                             w, h = max(xs) - min(xs), max(ys) - min(ys)
                                             if h <= 0 or w <= 0:
                                                 continue
-                                            points_xy_orig = [(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in points_xy] if (scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0) else points_xy
                                             draw_bboxes_d.append((x1, y1, x2, y2))
                                             draw_plate_points_d.append(points_xy)
+                                            draw_confs_d.append(conf_d)
                                 if scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0:
                                     draw_bboxes_d = [(int(x1 * scale_to_orig_x), int(y1 * scale_to_orig_y), int(x2 * scale_to_orig_x), int(y2 * scale_to_orig_y)) for (x1, y1, x2, y2) in draw_bboxes_d]
                                     draw_plate_points_d = [[(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in pts] for pts in draw_plate_points_d]
-                                with self._last_draw_lock:
-                                    self._last_draw_bboxes = draw_bboxes_d
-                                    self._last_draw_plate_points = draw_plate_points_d
+                                if draw_bboxes_d or draw_plate_points_d:
+                                    logger.info("ALPR: запись _last_draw_bboxes (detection_only), кол-во bbox: %s", len(draw_bboxes_d))
+                                    with self._last_draw_lock:
+                                        self._last_draw_bboxes = draw_bboxes_d
+                                        self._last_draw_confidences = draw_confs_d
+                                        self._last_draw_plate_points = draw_plate_points_d
+                                        self._bbox_history.append(list(draw_bboxes_d))
+                                        self._conf_history.append(list(draw_confs_d))
+                                        self._last_draw_time = time.time()
                     try:
                         Path(path).unlink(missing_ok=True)
                     except Exception:
                         pass
                     return
-                # При ALPR_DETECT_THEN_OCR_ASYNC=False всегда полный пайплайн (нашли рамку и сразу распознали). При True — только детекция, OCR в фоне.
+                # При ALPR_DETECT_THEN_OCR_ASYNC=False всегда полный пайплайн. При True — только детекция, OCR в фоне.
                 run_full = SEND_DETECTION_ONLY or not ALPR_DETECT_THEN_OCR_ASYNC or (self._alpr_cycle_count % ALPR_FULL_EVERY_N_CYCLES == 1)
                 if not run_full:
                     detect_only_fn = _get_detect_only_pipeline()
                     if detect_only_fn is not None:
                         result_det = detect_only_fn([path])
+                        time.sleep(0)  # отдать управление другим потокам
                         if result_det and len(result_det) > 0:
                             out = result_det[0]
-                            # number_plate_localization: result[0] = (detections_for_image, image); для одного кадра — одна пара
                             if isinstance(out, (list, tuple)) and len(out) >= 1:
                                 detections = out[0] if isinstance(out[0], list) else []
                                 draw_bboxes_d: List[Tuple[int, int, int, int]] = []
                                 draw_plate_points_d: List[List[Tuple[int, int]]] = []
+                                draw_confs_d: List[float] = []
                                 for det in detections:
                                     if not hasattr(det, "__len__") or len(det) < 7:
                                         continue
@@ -706,6 +793,7 @@ class CameraWorker:
                                             points_xy_orig = [(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in points_xy] if (scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0) else points_xy
                                             draw_bboxes_d.append((x1, y1, x2, y2))
                                             draw_plate_points_d.append(points_xy)
+                                            draw_confs_d.append(conf_d)
                                             if ALPR_DETECT_THEN_OCR_ASYNC and h > 0 and w > 0:
                                                 cx, cy = (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2
                                                 if self._dedup_and_emit_region(cx, cy):
@@ -722,15 +810,22 @@ class CameraWorker:
                                 if scale_to_orig_x != 1.0 or scale_to_orig_y != 1.0:
                                     draw_bboxes_d = [(int(x1 * scale_to_orig_x), int(y1 * scale_to_orig_y), int(x2 * scale_to_orig_x), int(y2 * scale_to_orig_y)) for (x1, y1, x2, y2) in draw_bboxes_d]
                                     draw_plate_points_d = [[(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in pts] for pts in draw_plate_points_d]
-                                with self._last_draw_lock:
-                                    self._last_draw_bboxes = draw_bboxes_d
-                                    self._last_draw_plate_points = draw_plate_points_d
+                                if draw_bboxes_d or draw_plate_points_d:
+                                    logger.info("ALPR: запись _last_draw_bboxes (detect_only async), кол-во bbox: %s", len(draw_bboxes_d))
+                                    with self._last_draw_lock:
+                                        self._last_draw_bboxes = draw_bboxes_d
+                                        self._last_draw_confidences = draw_confs_d
+                                        self._last_draw_plate_points = draw_plate_points_d
+                                        self._bbox_history.append(list(draw_bboxes_d))
+                                        self._conf_history.append(list(draw_confs_d))
+                                        self._last_draw_time = time.time()
                         try:
                             Path(path).unlink(missing_ok=True)
                         except Exception:
                             pass
                         return
                 result = pipeline_fn([path])
+                time.sleep(0)  # отдать управление другим потокам
                 unpacked = unzip(result)
                 if len(unpacked) >= 9:
                     images_bboxs, images_points, region_names, confidences, texts = (
@@ -781,9 +876,19 @@ class CameraWorker:
                         [(int(x * scale_to_orig_x), int(y * scale_to_orig_y)) for x, y in pts]
                         for pts in draw_plate_points
                     ]
-                with self._last_draw_lock:
-                    self._last_draw_bboxes = draw_bboxes
-                    self._last_draw_plate_points = draw_plate_points
+                draw_confidences: List[float] = [
+                    conf_list[i] if i < len(conf_list) else 0.5
+                    for i in range(len(draw_bboxes))
+                ]
+                if draw_bboxes or draw_plate_points:
+                    logger.info("ALPR: запись _last_draw_bboxes (full pipeline), кол-во bbox: %s", len(draw_bboxes))
+                    with self._last_draw_lock:
+                        self._last_draw_bboxes = draw_bboxes
+                        self._last_draw_confidences = draw_confidences
+                        self._last_draw_plate_points = draw_plate_points
+                        self._bbox_history.append(list(draw_bboxes))
+                        self._conf_history.append(list(draw_confidences))
+                        self._last_draw_time = time.time()
                 num_raw = len(points_list)
                 passed = 0
                 if self._alpr_cycle_count == 1:
@@ -904,10 +1009,10 @@ class CameraWorker:
         if self._ocr_thread is not None:
             self._ocr_thread.join(timeout=10.0)
             self._ocr_thread = None
-        self.stop_recording()
         if self._alpr_thread is not None:
             self._alpr_thread.join(timeout=5.0)
             self._alpr_thread = None
+        self.stop_recording()
         if self._cap:
             self._cap.release()
             self._cap = None
@@ -1077,11 +1182,85 @@ class CameraWorker:
             self._first_frame_logged = True
             logger.info("Камера: первый кадр получен (для показа и ALPR)")
         # Отрисовка боксов детекции и рамок номеров поверх кадра
+        # Путь данных: _last_draw_bboxes (и _last_draw_confidences, _last_draw_plate_points) записываются
+        # в _run_alpr_on_frame() из потока ALPR при непустом результате detect_only_fn() или pipeline_fn().
+        # Здесь под lock копируем их в bboxes/confidences/plate_pts, по bboxes и _bbox_history считаем
+        # сглаженные координаты (smoothed_bboxes), затем рисуем cv2.rectangle по ним на frame.
+        # Отображение: CameraThread.run() вызывает read_frame() → frame_ready.emit(jpeg_bytes) →
+        # MainWindow._on_frame сохраняет в _latest_frame_bytes → _paint_latest_frame выводит в QLabel (QPixmap).
         with self._last_draw_lock:
             bboxes = list(self._last_draw_bboxes)
+            confidences = list(self._last_draw_confidences)
             plate_pts = [list(pts) for pts in self._last_draw_plate_points]
-        if (DRAW_OBJECT_BOXES and bboxes) or plate_pts:
+            hist_bbox = list(self._bbox_history)
+            hist_conf = list(self._conf_history)
+            last_draw_time = self._last_draw_time
+        # Таймаут 2 с: очищать рамки только если номер не находился более 2 секунд
+        if (bboxes or plate_pts) and (time.time() - last_draw_time > 2.0):
+            with self._last_draw_lock:
+                self._last_draw_bboxes = []
+                self._last_draw_confidences = []
+                self._last_draw_plate_points = []
+                self._bbox_history.clear()
+                self._conf_history.clear()
+            bboxes = []
+            confidences = []
+            plate_pts = []
+            hist_bbox = []
+            hist_conf = []
+        # Диагностика: что видит read_frame после чтения под lock (только при непустых bboxes)
+        if bboxes:
+            logger.info(
+                "read_frame: bboxes=%s, hist_bbox_len=%s, plate_pts_len=%s",
+                len(bboxes), len(hist_bbox), len(plate_pts),
+            )
+        # Сглаживание bbox скользящим средним за последние N кадров
+        smoothed_bboxes: List[Tuple[int, int, int, int]] = []
+        for i in range(len(bboxes)):
+            coords = [h[i] for h in hist_bbox if len(h) > i]
+            if coords:
+                x1 = int(sum(c[0] for c in coords) / len(coords))
+                y1 = int(sum(c[1] for c in coords) / len(coords))
+                x2 = int(sum(c[2] for c in coords) / len(coords))
+                y2 = int(sum(c[3] for c in coords) / len(coords))
+                smoothed_bboxes.append((x1, y1, x2, y2))
+            else:
+                smoothed_bboxes.append(bboxes[i])
+        confs = [confidences[i] if i < len(confidences) else 0.5 for i in range(len(bboxes))]
+        # Рисовать при любых данных: bboxes и/или plate_pts (DRAW_OBJECT_BOXES только для оранжевых боксов)
+        draw_src = smoothed_bboxes if smoothed_bboxes else bboxes
+        will_draw = bool(draw_src or plate_pts or (DRAW_OBJECT_BOXES and bboxes))
+        if bboxes:
+            logger.info(
+                "read_frame: smoothed_bboxes=%s, draw_src=%s, will_draw=%s",
+                len(smoothed_bboxes), len(draw_src), will_draw,
+            )
+        if draw_src or plate_pts or (DRAW_OBJECT_BOXES and bboxes):
+            if bboxes and not draw_src:
+                logger.info("ALPR: отрисовка по bboxes (smoothed пустой), кол-во: %s, hist_len: %s", len(bboxes), len(hist_bbox))
             frame = frame.copy()
+            h_frame, w_frame = frame.shape[0], frame.shape[1]
+            pad = PLATE_BOX_PADDING_PX
+            for i, (x1, y1, x2, y2) in enumerate(draw_src):
+                x1_p = max(0, x1 - pad)
+                y1_p = max(0, y1 - pad)
+                x2_p = min(w_frame, x2 + pad)
+                y2_p = min(h_frame, y2 + pad)
+                conf = confs[i] if i < len(confs) else 0.5
+                if conf <= 0.55:
+                    color = (0, 0, 255)  # красный
+                elif conf <= 0.75:
+                    color = (0, 255, 255)  # жёлтый
+                else:
+                    color = (0, 255, 0)  # зелёный
+                logger.info("Отрисовка рамки bbox: (%s, %s, %s, %s)", x1_p, y1_p, x2_p, y2_p)
+                cv2.rectangle(frame, (x1_p, y1_p), (x2_p, y2_p), color, 2)
+                label = f"{int(round(conf * 100))}%"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                ly1 = max(0, y1_p - th - 4)
+                lx2 = min(w_frame, x1_p + tw + 4)
+                cv2.rectangle(frame, (x1_p, ly1), (lx2, y1_p), (0, 0, 0), -1)
+                cv2.putText(frame, label, (x1_p + 2, y1_p - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             if DRAW_OBJECT_BOXES:
                 for (x1, y1, x2, y2) in bboxes:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 120, 0), 2)  # синий — бокс детектора
